@@ -1,7 +1,6 @@
 package dnsscan
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,7 +80,6 @@ func (t *TruthTable) FetchTruth() error {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 			ForceAttemptHTTP2: true,
 		},
 	}

@@ -1,0 +1,101 @@
+name: Build Desktop Multi-Platform
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "agent/**"
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Test
+        run: go test ./...
+      - name: Vet scanner and mobile API
+        run: go vet ./internal/dnsscan ./mobile
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            output: whitedns-windows-amd64.exe
+          - goos: linux
+            goarch: amd64
+            output: whitedns-linux-amd64
+          - goos: linux
+            goarch: arm64
+            output: whitedns-linux-arm64
+          - goos: android
+            goarch: arm64
+            output: whitedns-termux-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.output }}" ./cmd/whitedns
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          if-no-files-found: error
+          retention-days: 30
+
+  build-macos:
+    needs: test
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            output: whitedns-macos-amd64
+          - goarch: arm64
+            output: whitedns-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Build macOS/${{ matrix.goarch }}
+        env:
+          GOOS: darwin
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.output }}" ./cmd/whitedns
+      - name: Ad-hoc sign
+        run: codesign --force --sign - "dist/${{ matrix.output }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          if-no-files-found: error
+          retention-days: 30

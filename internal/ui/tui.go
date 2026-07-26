@@ -409,7 +409,8 @@ type tuiModel struct {
 	typingEnabled bool
 
 	// dnsProtocol holds the transport chosen on the DNS port screen:
-	// "both" (UDP+TCP/53), "dot" (853), "doh" (443), or "all".
+	// "udp", "tcp", "both" (UDP+TCP/53), or "all" (encrypted-port presets
+	// are distinguished by their selected port list).
 	dnsProtocol string
 	// dnsConcurrency is the resolver worker-pool size chosen on the DNS worker
 	// screen (0 => defaultDNSWorkers).
