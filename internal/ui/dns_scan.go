@@ -64,6 +64,8 @@ type dnsPortPreset struct {
 
 var dnsPortPresets = []dnsPortPreset{
 	{"Port 53 - standard DNS (UDP + TCP)", "both", []int{53}},
+	{"UDP/53 only - fastest Do53 scan", "udp", []int{53}},
+	{"TCP/53 only - UDP-blocked networks", "tcp", []int{53}},
 	{"DoT - DNS-over-TLS (853)", "all", []int{853}},
 	{"DoH - DNS-over-HTTPS (443)", "all", []int{443}},
 	{"All valid DNS ports (53 + 853 + 443)", "all", []int{53, 853, 443}},
@@ -337,8 +339,14 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				if r.Responded {
 					status = fmt.Sprintf("resp %dms", r.BestLatency.Milliseconds())
 				}
-				trySend(logMsg{text: fmt.Sprintf("%-21s %-13s score=%d/6 RA=%v EDNS=%v POISON=%v TXT=%v TRANSP=%v TUNNEL=%v (%s)",
-					r.IP, status, r.Score, r.RA, r.EDNS, r.Poisoned, r.TxtPass, r.Transparent, r.TunnelReady, r.TunnelReason)})
+				trySend(logMsg{text: fmt.Sprintf("%-21s %-13s score=%d/6 RA=%v EDNS=%v POISON=%v TXT=%v HIJACK=%v(%s) PATH=%s/%s TUNNEL=%v (%s)",
+					r.IP, status, r.Score, r.RA, r.EDNS, r.Poisoned, r.TxtPass,
+					r.Transparent, r.HijackConfidence, r.PreferredTransport, r.FallbackTransport,
+					r.TunnelReady, r.TunnelReason)})
+				if r.HijackReason != "" {
+					trySend(logMsg{text: fmt.Sprintf("    hijack evidence=%s paths=udp:%v,tcp:%v checks=%d anomalies=%d rcodes=%s",
+						r.HijackReason, r.HijackUDP, r.HijackTCP, r.HijackChecks, r.HijackAnomalies, r.HijackRCodes)})
+				}
 				for _, hd := range r.HeaderDump() {
 					trySend(logMsg{text: "    " + hd})
 				}

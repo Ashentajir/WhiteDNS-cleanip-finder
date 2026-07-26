@@ -1306,11 +1306,16 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 				}
 				line := fmt.Sprintf("%-15s %-13s verdict=%s score=%d/6 tunnel=%v (%s)",
 					r.IP, status, r.Status, r.Score, r.TunnelReady, r.TunnelReason)
+				line += fmt.Sprintf(" path=%s fallback=%s udp_poison=%v tcp_poison=%v",
+					r.PreferredTransport, r.FallbackTransport, r.UDPPoisoned, r.TCPPoisoned)
 				if r.PoisonIP != "" {
 					line += " poison_ip=" + r.PoisonIP
 				}
 				if r.HijackIP != "" {
 					line += " hijack_ip=" + r.HijackIP
+				}
+				if r.HijackReason != "" {
+					line += fmt.Sprintf(" hijack=%s:%s", r.HijackConfidence, r.HijackReason)
 				}
 				lf.write(line)
 				if logThrottle.allow() {

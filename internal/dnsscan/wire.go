@@ -153,11 +153,46 @@ func skipDnsName(packet []byte, offset int) int {
 	}
 }
 
+func readDnsName(packet []byte, offset int) (string, int, error) {
+	labels := make([]string, 0, 8)
+	next := -1
+	visited := 0
+	for {
+		if offset < 0 || offset >= len(packet) || visited > len(packet) {
+			return "", -1, fmt.Errorf("malformed dns name")
+		}
+		visited++
+		length := int(packet[offset])
+		if length&0xC0 == 0xC0 {
+			if offset+1 >= len(packet) {
+				return "", -1, fmt.Errorf("truncated dns pointer")
+			}
+			if next < 0 {
+				next = offset + 2
+			}
+			offset = int(binary.BigEndian.Uint16(packet[offset:offset+2]) & 0x3FFF)
+			continue
+		}
+		if length&0xC0 != 0 || length > 63 || offset+1+length > len(packet) {
+			return "", -1, fmt.Errorf("invalid dns label")
+		}
+		offset++
+		if length == 0 {
+			if next < 0 {
+				next = offset
+			}
+			return strings.Join(labels, "."), next, nil
+		}
+		labels = append(labels, string(packet[offset:offset+length]))
+		offset += length
+	}
+}
+
 // parseDnsMessage decodes a full DNS response: header, answer records of the
 // requested type, and whether an EDNS0 OPT record is present anywhere. When
 // checkTxid is set the response ID must equal wantTxid and QR must be set —
 // rejecting blindly-spoofed / off-path injected packets.
-func parseDnsMessage(packet []byte, qtype uint16, wantTxid uint16, checkTxid bool) (DnsHeader, []string, bool, error) {
+func parseDnsMessage(packet []byte, qtype uint16, wantTxid uint16, checkTxid bool, wantName string) (DnsHeader, []string, bool, error) {
 	hdr, err := parseDnsHeader(packet)
 	if err != nil {
 		return DnsHeader{}, nil, false, err
@@ -168,17 +203,30 @@ func parseDnsMessage(packet []byte, qtype uint16, wantTxid uint16, checkTxid boo
 	if !hdr.QR {
 		return hdr, nil, false, fmt.Errorf("not a response (QR=0)")
 	}
-	if hdr.Rcode != 0 {
-		return hdr, nil, false, fmt.Errorf("dns error rcode=%d", hdr.Rcode)
-	}
-
 	offset := 12
 	for i := 0; i < int(hdr.QDCount); i++ {
-		offset = skipDnsName(packet, offset)
+		questionName, next, nameErr := readDnsName(packet, offset)
+		offset = next
 		if offset < 0 || offset+4 > len(packet) {
 			return hdr, nil, false, fmt.Errorf("malformed question section")
 		}
+		questionType := binary.BigEndian.Uint16(packet[offset : offset+2])
+		questionClass := binary.BigEndian.Uint16(packet[offset+2 : offset+4])
+		if nameErr != nil {
+			return hdr, nil, false, nameErr
+		}
+		if wantName != "" && (hdr.QDCount != 1 ||
+			!strings.EqualFold(strings.TrimSuffix(questionName, "."), strings.TrimSuffix(wantName, ".")) ||
+			questionType != qtype || questionClass != 1) {
+			return hdr, nil, false, fmt.Errorf("question mismatch")
+		}
 		offset += 4 // QTYPE + QCLASS
+	}
+	if wantName != "" && hdr.QDCount != 1 {
+		return hdr, nil, false, fmt.Errorf("question mismatch")
+	}
+	if hdr.Rcode != 0 {
+		return hdr, nil, false, fmt.Errorf("dns error rcode=%d", hdr.Rcode)
 	}
 
 	var answers []string
