@@ -73,6 +73,12 @@ type ResolverResult struct {
 	PreferredTransport    string        // fastest usable Do53 path: udp or tcp
 	FallbackTransport     string        // warm alternate Do53 path, when available
 	RA                    bool          // open recursion advertised
+	AA                    bool          // authoritative answer seen on any probe
+	TC                    bool          // truncated answer seen on any probe
+	RD                    bool          // recursion-desired flag echoed by any probe
+	RCodes                string        // compact per-path response codes (for example UDP/53=0,TCP/53=2)
+	QDCount               int           // maximum question count seen across probes
+	ANCount               int           // maximum answer count seen across probes
 	EDNS                  bool          // EDNS0 large-payload usable
 	Poisoned              bool          // any A answer mismatched the truth table
 	TxtPass               bool          // TXT rdata returned intact
@@ -135,27 +141,86 @@ func StatusColor(status string) string {
 	}
 }
 
-// HeaderDump returns one "PROTO | header" line per probe (full header per probe).
+// HeaderDump returns concise per-probe detection details. Responded (QR), RA,
+// NS, and AR already have aggregate result fields, so they are intentionally
+// omitted here instead of repeating the full raw DNS header.
 func (r ResolverResult) HeaderDump() []string {
 	lines := make([]string, 0, len(r.Probes)+1)
 	for _, p := range r.Probes {
-		hdr := "(no header)"
-		if p.HeaderOK {
-			hdr = p.Header.String()
+		if !p.HeaderOK {
+			line := fmt.Sprintf("%-8s no-header", p.Protocol)
+			if p.Error != "" {
+				line += " | error=" + p.Error
+			}
+			lines = append(lines, line)
+			continue
 		}
-		ans := strings.Join(p.AnswerIPs, ",")
-		lines = append(lines, fmt.Sprintf("%-8s %s | ans=%s poison=%t injection=%t err=%s",
-			p.Protocol, hdr, ans, p.IsPoisoned, p.InjectionObserved, p.Error))
+		line := fmt.Sprintf("%-8s aa=%s tc=%s rd=%s rcode=%d qd=%d an=%d",
+			p.Protocol, ynb(p.Header.AA), ynb(p.Header.TC), ynb(p.Header.RD),
+			p.Header.Rcode, p.Header.QDCount, p.Header.ANCount)
+		var findings []string
+		if len(p.AnswerIPs) > 0 {
+			findings = append(findings, "answer="+strings.Join(p.AnswerIPs, ","))
+		}
+		if p.IsPoisoned {
+			findings = append(findings, "POISON")
+		}
+		if p.InjectionObserved {
+			findings = append(findings, "INJECTION")
+		}
+		if p.Error != "" {
+			findings = append(findings, "error="+p.Error)
+		}
+		if len(findings) > 0 {
+			line += " | " + strings.Join(findings, " ")
+		}
+		lines = append(lines, line)
 	}
 	if r.TxtProbe.Protocol != "" {
-		hdr := "(no header)"
-		if r.TxtProbe.HeaderOK {
-			hdr = r.TxtProbe.Header.String()
+		p := r.TxtProbe
+		protocol := "TXT/" + p.Protocol
+		if !p.HeaderOK {
+			line := fmt.Sprintf("%-8s no-header", protocol)
+			if p.Error != "" {
+				line += " | error=" + p.Error
+			}
+			lines = append(lines, line)
+		} else {
+			line := fmt.Sprintf("%-8s aa=%s tc=%s rd=%s rcode=%d qd=%d an=%d | txt-records=%d",
+				protocol, ynb(p.Header.AA), ynb(p.Header.TC), ynb(p.Header.RD),
+				p.Header.Rcode, p.Header.QDCount, p.Header.ANCount, len(p.AnswerTXT))
+			if p.Error != "" {
+				line += " error=" + p.Error
+			}
+			lines = append(lines, line)
 		}
-		lines = append(lines, fmt.Sprintf("%-8s %s | txt=%s err=%s",
-			"TXT/"+r.TxtProbe.Protocol, hdr, strings.Join(r.TxtProbe.AnswerTXT, ""), r.TxtProbe.Error))
 	}
 	return lines
+}
+
+func mergeHeaderSummary(result *ResolverResult, probe DnsProbeResult) {
+	if !probe.HeaderOK {
+		return
+	}
+	result.AA = result.AA || probe.Header.AA
+	result.TC = result.TC || probe.Header.TC
+	result.RD = result.RD || probe.Header.RD
+	if int(probe.Header.QDCount) > result.QDCount {
+		result.QDCount = int(probe.Header.QDCount)
+	}
+	if int(probe.Header.ANCount) > result.ANCount {
+		result.ANCount = int(probe.Header.ANCount)
+	}
+	rcode := fmt.Sprintf("%s=%d", probe.Protocol, probe.Header.Rcode)
+	for _, existing := range strings.Split(result.RCodes, ",") {
+		if existing == rcode {
+			return
+		}
+	}
+	if result.RCodes != "" {
+		result.RCodes += ","
+	}
+	result.RCodes += rcode
 }
 
 // ScanResolvers probes every resolver IP and reports aggregated results. The
@@ -271,6 +336,7 @@ func ScanResolver(ctx context.Context, ip string, opts Options, truth *TruthTabl
 		// zone, so gating on a clean A answer wrongly discarded them.
 		if p.HeaderOK {
 			res.Responded = true
+			mergeHeaderSummary(&res, p)
 			if strings.HasPrefix(p.Protocol, "UDP") {
 				res.UDPOK = true
 				if p.TTFB > 0 && (udpLatency == 0 || p.TTFB < udpLatency) {

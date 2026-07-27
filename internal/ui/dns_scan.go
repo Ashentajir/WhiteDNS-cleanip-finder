@@ -339,10 +339,12 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				if r.Responded {
 					status = fmt.Sprintf("resp %dms", r.BestLatency.Milliseconds())
 				}
-				trySend(logMsg{text: fmt.Sprintf("%-21s %-13s score=%d/6 RA=%v EDNS=%v POISON=%v TXT=%v HIJACK=%v(%s) PATH=%s/%s TUNNEL=%v (%s)",
-					r.IP, status, r.Score, r.RA, r.EDNS, r.Poisoned, r.TxtPass,
-					r.Transparent, r.HijackConfidence, r.PreferredTransport, r.FallbackTransport,
+				trySend(logMsg{text: fmt.Sprintf("%-21s %-13s score=%d/6 path=%s/%s tunnel=%v (%s)",
+					r.IP, status, r.Score, r.PreferredTransport, r.FallbackTransport,
 					r.TunnelReady, r.TunnelReason)})
+				trySend(logMsg{text: fmt.Sprintf("    detect RA=%v AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d EDNS=%v TXT=%v poison=%v hijack=%v(%s)",
+					r.RA, r.AA, r.TC, r.RD, r.RCodes, r.QDCount, r.ANCount, r.NSCount, r.ARCount,
+					r.EDNS, r.TxtPass, r.Poisoned, r.Transparent, r.HijackConfidence)})
 				if r.HijackReason != "" {
 					trySend(logMsg{text: fmt.Sprintf("    hijack evidence=%s paths=udp:%v,tcp:%v checks=%d anomalies=%d rcodes=%s",
 						r.HijackReason, r.HijackUDP, r.HijackTCP, r.HijackChecks, r.HijackAnomalies, r.HijackRCodes)})
