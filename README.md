@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Desktop 1.3.6 and Android 1.3.6 clean-IP scanner, proxy checker, ASN target expander, and WhiteDNS toolkit.</strong>
+  <strong>Desktop 1.3.7 and Android 1.3.7 clean-IP scanner, proxy checker, ASN target expander, and WhiteDNS toolkit.</strong>
 </p>
 
 <p align="center">
@@ -22,8 +22,8 @@
 
 | Release | Platform | What You Get | Best For |
 |---|---|---|---|
-| **WhiteDNS Desktop 1.3.6** | Windows, Linux, macOS, Termux | Terminal UI, proxy tools, scanner engine, config workflows, cross-platform binaries | Power users, desktop scanning, bulk workflows |
-| **WhiteDNS IP Scanner Android 1.3.6** | Android API 21+ | Native Android app, IP/CIDR scanner, SNI scanner, HTTP/SOCKS5 proxy scanner, ASN export, signed APK/AAB outputs | Phone-based scanning and portable clean-IP discovery |
+| **WhiteDNS Desktop 1.3.7** | Windows, Linux, macOS, Termux | Terminal UI, proxy tools, scanner engine, config workflows, cross-platform binaries | Power users, desktop scanning, bulk workflows |
+| **WhiteDNS IP Scanner Android 1.3.7** | Android API 21+ | Native Android app, IP/CIDR scanner, SNI scanner, HTTP/SOCKS5 proxy scanner, ASN export, signed APK/AAB outputs | Phone-based scanning and portable clean-IP discovery |
 
 Download the latest files from the **GitHub Releases** page:
 
@@ -49,7 +49,7 @@ WhiteDNS is a clean-IP discovery and proxy workflow toolkit. It expands IP range
 
 ---
 
-## Desktop 1.3.6 Guide
+## Desktop 1.3.7 Guide
 
 ### Download
 
@@ -134,6 +134,7 @@ Proxy-only mode (macOS/Linux):
 
 - Results and logs are written beside the executable in WhiteDNS output folders.
 - DNS scans can probe port 53 over UDP/TCP, port 853 over DoT, and port 443 over DoH. DoT and DoH use a Chrome-style uTLS ClientHello to reduce TLS-fingerprint blocking while preserving the protocol-specific ALPN behavior.
+- DNS transport and TXT probes run concurrently. Choose **Fast** scan depth to keep the core A-integrity, RA, EDNS, and TXT tunnel checks while skipping the additional NXDOMAIN hijack probes; **Full** retains every validation check.
 - DNS reports are written to the `dns scan` folder in text, CSV, JSON, and XLSX formats.
 - ASN datasets and Cloudflare domain assets are embedded in the binary.
 - Use the TUI for the full workflow experience.
@@ -141,7 +142,7 @@ Proxy-only mode (macOS/Linux):
 
 ---
 
-## Android 1.3.6 Guide
+## Android 1.3.7 Guide
 
 ### Download
 

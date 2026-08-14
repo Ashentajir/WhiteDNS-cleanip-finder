@@ -102,7 +102,7 @@ func renderMenuTitle(width int, logs int) string {
 	meta := sDim.Render(fmt.Sprintf("logs:%d  %s", logs, time.Now().Format("15:04:05")))
 
 	if width < 72 {
-		line := renderGradientText("WHITEDNS v1.3.6", brandColors, true)
+		line := renderGradientText("WHITEDNS v1.3.7", brandColors, true)
 		credit := renderGradientText("developed by TAjirax", devColors, false)
 		return lipgloss.PlaceHorizontal(width, lipgloss.Center, line) + "\n" +
 			lipgloss.PlaceHorizontal(width, lipgloss.Center, credit) + "\n" +
@@ -131,7 +131,7 @@ func renderMenuTitle(width int, logs int) string {
 		out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, renderGradientText(line, brandColors, true)))
 		out.WriteString("\n")
 	}
-	tagline := renderGradientText("v1.3.6  -  developed by TAjirax", devColors, true)
+	tagline := renderGradientText("v1.3.7  -  developed by TAjirax", devColors, true)
 	out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, tagline))
 	out.WriteString("\n")
 	out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, meta))
@@ -409,11 +409,15 @@ type tuiModel struct {
 	typingEnabled bool
 
 	// dnsProtocol holds the transport chosen on the DNS port screen:
-	// "both" (UDP+TCP/53), "dot" (853), "doh" (443), or "all".
+	// "udp", "tcp", "both" (UDP+TCP/53), or "all" (encrypted-port presets
+	// are distinguished by their selected port list).
 	dnsProtocol string
 	// dnsConcurrency is the resolver worker-pool size chosen on the DNS worker
 	// screen (0 => defaultDNSWorkers).
 	dnsConcurrency int
+	// dnsScanDepth is "fast" (core tunnel checks) or "full" (also performs
+	// NXDOMAIN hijack validation). Empty preserves the full engine default.
+	dnsScanDepth string
 	// dnsTestNearby toggles /24 nearby-IP expansion around tunnel-ready hits,
 	// chosen on the DNS "Test Nearby IPs" screen (default off).
 	dnsTestNearby bool
@@ -816,6 +820,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m, screenCmd = m.handleDNSPortsScreen(msg)
 	case screenDNSReference:
 		m, screenCmd = m.handleDNSReferenceScreen(msg)
+	case screenDNSDepth:
+		m, screenCmd = m.handleDNSDepthScreen(msg)
 	case screenDNSWorkers:
 		m, screenCmd = m.handleDNSWorkersScreen(msg)
 	case screenDNSNearby:
@@ -895,6 +901,8 @@ func (m tuiModel) View() string {
 		body = m.viewDNSPorts(w, h)
 	case screenDNSReference:
 		body = m.viewDNSReference(w, h)
+	case screenDNSDepth:
+		body = m.viewDNSDepth(w, h)
 	case screenDNSWorkers:
 		body = m.viewDNSWorkers(w, h)
 	case screenDNSNearby:

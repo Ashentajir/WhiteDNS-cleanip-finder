@@ -14,13 +14,14 @@ import (
 
 // DnsProbeResult is the outcome of a single DNS protocol probe against one resolver.
 type DnsProbeResult struct {
-	Protocol   string        // e.g. "UDP/53", "TCP/53", "DoT/853", "DoH/443"
-	Responded  bool          // parseable DNS response received?
-	IsPoisoned bool          // A-record answer mismatched the truth table?
-	AnswerIPs  []string      // A-record IPs
-	AnswerTXT  []string      // TXT strings
-	TTFB       time.Duration // time-to-first-byte
-	Error      string        // empty on success
+	Protocol          string        // e.g. "UDP/53", "TCP/53", "DoT/853", "DoH/443"
+	Responded         bool          // parseable DNS response received?
+	IsPoisoned        bool          // A-record answer mismatched the truth table?
+	InjectionObserved bool          // forged NXDOMAIN raced a later usable UDP answer
+	AnswerIPs         []string      // A-record IPs
+	AnswerTXT         []string      // TXT strings
+	TTFB              time.Duration // time-to-first-byte
+	Error             string        // empty on success
 
 	Header   DnsHeader // parsed response header (all flags + counts)
 	HeaderOK bool      // header was parsed
@@ -32,18 +33,20 @@ type DnsProbeResult struct {
 // ProbeUDP sends a DNS A query over UDP (with EDNS0→bare fallback).
 func ProbeUDP(ctx context.Context, resolverIP, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("UDP/%d", port)}
-	hdr, ips, edns, ttfb, err := probeUDPWithFallback(ctx, resolverIP, domain, 1, timeout, dialer, port)
+	hdr, ips, edns, ttfb, injected, err := probeUDPWithFallback(ctx, resolverIP, domain, 1, timeout, dialer, port, truth != nil)
 	result.TTFB = ttfb
+	result.InjectionObserved = injected
 	if err != nil {
 		result.Error = "UDP: " + err.Error()
 		result.Header, result.HeaderOK = hdr, hdr.QR
+		result.IsPoisoned = injected
 		return result
 	}
 	result.Responded = true
 	result.AnswerIPs = ips
 	result.Header, result.HeaderOK, result.EDNS = hdr, true, edns
 	if truth != nil {
-		result.IsPoisoned = !truth.Verify(ips)
+		result.IsPoisoned = injected || !truth.Verify(ips)
 	}
 	return result
 }
@@ -76,10 +79,10 @@ func ProbeTCP(ctx context.Context, resolverIP, domain string, truth *TruthTable,
 		result.Error = "TCP_READ: " + truncErr(err)
 		return result
 	}
-	hdr, ips, edns, err := parseDnsMessage(respBuf, 1, txid, true)
+	hdr, ips, edns, err := parseDnsMessage(respBuf, 1, txid, true, domain)
 	if err != nil {
 		result.Error = "TCP_PARSE: " + err.Error()
-		result.Header, result.HeaderOK = hdr, hdr.QR
+		result.Header, result.HeaderOK = hdr, trustedResponseHeader(hdr, err)
 		return result
 	}
 	result.Responded = true
@@ -119,10 +122,10 @@ func ProbeDoT(ctx context.Context, resolverIP, domain string, truth *TruthTable,
 		result.Error = "DoT_READ: " + truncErr(err)
 		return result
 	}
-	hdr, ips, edns, err := parseDnsMessage(respBuf, 1, txid, true)
+	hdr, ips, edns, err := parseDnsMessage(respBuf, 1, txid, true, domain)
 	if err != nil {
 		result.Error = "DoT_PARSE: " + err.Error()
-		result.Header, result.HeaderOK = hdr, hdr.QR
+		result.Header, result.HeaderOK = hdr, trustedResponseHeader(hdr, err)
 		return result
 	}
 	result.Responded = true
@@ -171,8 +174,9 @@ func ProbeDoH(ctx context.Context, resolverIP, domain string, truth *TruthTable,
 // ProbeTXTUDP sends a TXT query over UDP (with EDNS0→bare fallback).
 func ProbeTXTUDP(ctx context.Context, resolverIP, queryName string, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("UDP/%d", port)}
-	hdr, txts, edns, ttfb, err := probeUDPWithFallback(ctx, resolverIP, queryName, 16, timeout, dialer, port)
+	hdr, txts, edns, ttfb, injected, err := probeUDPWithFallback(ctx, resolverIP, queryName, 16, timeout, dialer, port, false)
 	result.TTFB = ttfb
+	result.InjectionObserved = injected
 	if err != nil {
 		result.Error = "UDP: " + err.Error()
 		result.Header, result.HeaderOK = hdr, hdr.QR
@@ -181,6 +185,61 @@ func ProbeTXTUDP(ctx context.Context, resolverIP, queryName string, timeout time
 	result.Responded = true
 	result.AnswerTXT = txts
 	result.Header, result.HeaderOK, result.EDNS = hdr, true, edns
+	return result
+}
+
+// ProbeTXTTCP sends a TXT query over DNS-over-TCP.
+func ProbeTXTTCP(ctx context.Context, resolverIP, queryName string, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
+	result := DnsProbeResult{Protocol: fmt.Sprintf("TCP/%d", port)}
+	if dialer == nil {
+		dialer = &net.Dialer{Timeout: timeout}
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port)))
+	if err != nil {
+		result.Error = "TCP_DIAL: " + truncErr(err)
+		return result
+	}
+	defer conn.Close()
+	return probeTXTStream(conn, queryName, timeout, result)
+}
+
+// ProbeTXTDoT sends a TXT query over DNS-over-TLS.
+func ProbeTXTDoT(ctx context.Context, resolverIP, queryName string, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
+	result := DnsProbeResult{Protocol: fmt.Sprintf("DoT/%d", port)}
+	if dialer == nil {
+		dialer = &net.Dialer{Timeout: timeout}
+	}
+	conn, err := dialUTLS(ctx, "tcp", net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port)), dialer, nil)
+	if err != nil {
+		result.Error = "DoT_TLS: " + truncErr(err)
+		return result
+	}
+	defer conn.Close()
+	return probeTXTStream(conn, queryName, timeout, result)
+}
+
+func probeTXTStream(conn net.Conn, queryName string, timeout time.Duration, result DnsProbeResult) DnsProbeResult {
+	query, txid := buildDnsQuery(queryName, 16, true)
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if err := writeTCPQuery(conn, query); err != nil {
+		result.Error = result.Protocol + "_WRITE: " + truncErr(err)
+		return result
+	}
+	start := time.Now()
+	packet, err := readTCPResponse(conn)
+	result.TTFB = time.Since(start)
+	if err != nil {
+		result.Error = result.Protocol + "_READ: " + truncErr(err)
+		return result
+	}
+	hdr, txts, edns, err := parseDnsMessage(packet, 16, txid, true, queryName)
+	result.Header, result.HeaderOK, result.EDNS = hdr, trustedResponseHeader(hdr, err), edns
+	if err != nil {
+		result.Error = result.Protocol + "_PARSE: " + truncErr(err)
+		return result
+	}
+	result.Responded = true
+	result.AnswerTXT = txts
 	return result
 }
 
@@ -218,21 +277,22 @@ func ProbeTXTDoH(ctx context.Context, resolverIP, queryName string, timeout time
 // traffic, so poisoned/broken resolvers are still observed rather than timing
 // out. Returns header, answers, whether EDNS0 is usable, TTFB, and an error if
 // both attempts fail.
-func probeUDPWithFallback(ctx context.Context, resolverIP, name string, qtype uint16, timeout time.Duration, dialer *net.Dialer, port int) (DnsHeader, []string, bool, time.Duration, error) {
+func probeUDPWithFallback(ctx context.Context, resolverIP, name string, qtype uint16, timeout time.Duration, dialer *net.Dialer, port int, waitThroughNXDOMAIN bool) (DnsHeader, []string, bool, time.Duration, bool, error) {
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: timeout}
 	}
 	conn, err := dialer.DialContext(ctx, "udp", addr)
 	if err != nil {
-		return DnsHeader{}, nil, false, 0, fmt.Errorf("DIAL: %s", truncErr(err))
+		return DnsHeader{}, nil, false, 0, false, fmt.Errorf("DIAL: %s", truncErr(err))
 	}
 	defer conn.Close()
 
 	var (
-		hdr     DnsHeader
-		ttfb    time.Duration
-		lastErr error
+		hdr      DnsHeader
+		ttfb     time.Duration
+		injected bool
+		lastErr  error
 	)
 	for i, useEDNS := range []bool{true, false} {
 		query, txid := buildDnsQuery(name, qtype, useEDNS)
@@ -242,34 +302,46 @@ func probeUDPWithFallback(ctx context.Context, resolverIP, name string, qtype ui
 			continue
 		}
 		start := time.Now()
-		h, answers, edns, perr := readUDPResponse(conn, txid, qtype)
+		h, answers, edns, sawInjection, perr := readUDPResponse(conn, txid, qtype, name, waitThroughNXDOMAIN)
+		injected = injected || sawInjection
 		attemptTTFB := time.Since(start)
 		if i == 0 || ttfb == 0 {
 			ttfb = attemptTTFB
 		}
 		if perr == nil {
-			return h, answers, edns, attemptTTFB, nil
+			return h, answers, edns, attemptTTFB, injected, nil
 		}
 		hdr, lastErr = h, fmt.Errorf("PARSE: %s", perr.Error())
 	}
-	return hdr, nil, false, ttfb, lastErr
+	return hdr, nil, false, ttfb, injected, lastErr
 }
 
 // readUDPResponse reads datagrams until one is a genuine response to our query
 // (matching TXID + QR set) or the deadline fires. Mismatched-TXID datagrams are
 // off-path spoofs / stragglers and are skipped — the core anti-injection guard.
-func readUDPResponse(conn net.Conn, txid, qtype uint16) (DnsHeader, []string, bool, error) {
+func readUDPResponse(conn net.Conn, txid, qtype uint16, name string, waitThroughNXDOMAIN bool) (DnsHeader, []string, bool, bool, error) {
 	buf := make([]byte, ednsUDPPayloadSize)
+	var injectedHeader DnsHeader
+	injected := false
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			return DnsHeader{}, nil, false, err
+			if injected {
+				return injectedHeader, nil, false, true, fmt.Errorf("injected NXDOMAIN without genuine answer: %w", err)
+			}
+			return DnsHeader{}, nil, false, false, err
 		}
-		hdr, answers, edns, perr := parseDnsMessage(buf[:n], qtype, txid, true)
-		if perr != nil && strings.Contains(perr.Error(), "txid mismatch") {
+		hdr, answers, edns, perr := parseDnsMessage(buf[:n], qtype, txid, true, name)
+		if perr != nil && (strings.Contains(perr.Error(), "txid mismatch") ||
+			strings.Contains(perr.Error(), "question mismatch")) {
 			continue
 		}
-		return hdr, answers, edns, perr
+		if perr != nil && waitThroughNXDOMAIN && hdr.Rcode == 3 {
+			injectedHeader = hdr
+			injected = true
+			continue
+		}
+		return hdr, answers, edns, injected, perr
 	}
 }
 

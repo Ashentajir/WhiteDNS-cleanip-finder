@@ -30,7 +30,11 @@ data class FormState(
     val liteMode: Boolean = false,
     val dnsProtocol: String = "both",     // dnsscan.Options.Protocol: udp | tcp | both | all
     val dnsReference: String = "google",  // truth-table reference resolver
+    val dnsScanDepth: String = "full",    // fast skips hijack validation; full runs every check
     val dnsTestNearby: Boolean = false,   // expand + rescan the /24 around tunnel-ready hits
+    // Speed test — runs after an IP scan on the IPs it found, ranking them by
+    // download/upload speed and ping (Android only; IP scan only).
+    val speedTestEnabled: Boolean = false,
     // DNSTT end-to-end tunnel test — runs after a DNS scan on its tunnel-ready shortlist.
     val e2eEnabled: Boolean = false,
     val e2eDomain: String = "",
@@ -73,9 +77,17 @@ private val CONCURRENCY_PRESETS = listOf(
 private data class DnsTransportPreset(val label: String, val protocol: String, val ports: String)
 private val DNS_TRANSPORT_PRESETS = listOf(
     DnsTransportPreset("Port 53 - standard DNS (UDP + TCP)", "both", "53"),
+    DnsTransportPreset("UDP/53 only - fastest transport", "udp", "53"),
+    DnsTransportPreset("TCP/53 only - UDP-blocked networks", "tcp", "53"),
     DnsTransportPreset("DoT - DNS-over-TLS (853)", "all", "853"),
     DnsTransportPreset("DoH - DNS-over-HTTPS (443)", "all", "443"),
     DnsTransportPreset("All valid DNS ports (53 + 853 + 443)", "all", "53,853,443"),
+)
+
+private data class DnsDepthPreset(val label: String, val value: String)
+private val DNS_DEPTH_PRESETS = listOf(
+    DnsDepthPreset("Fast - core A/RA/EDNS/TXT checks", "fast"),
+    DnsDepthPreset("Full - also detect NXDOMAIN hijacking", "full"),
 )
 
 // DNS reference resolver presets — the trusted resolver used to build the
@@ -206,6 +218,28 @@ fun ScanConfigForm(
                         )
                     }
                 }
+
+                Spacer(Modifier.height(14.dp))
+                SectionLabel("Scan depth")
+                Spacer(Modifier.height(4.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    DNS_DEPTH_PRESETS.forEach { preset ->
+                        FilterChip(
+                            selected = form.dnsScanDepth == preset.value,
+                            onClick = { onFormChange(form.copy(dnsScanDepth = preset.value)) },
+                            label = { Text(preset.label) },
+                            modifier = Modifier.fillMaxWidth().height(40.dp),
+                        )
+                    }
+                }
+                Text(
+                    if (form.dnsScanDepth == "fast")
+                        "Skips the extra NXDOMAIN hijack probes; tunnel-readiness and poisoning checks remain enabled"
+                    else
+                        "Runs every check, including repeated NXDOMAIN hijack validation",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
                 Spacer(Modifier.height(14.dp))
                 SectionLabel("Reference resolver (poisoning truth table)")
@@ -395,6 +429,29 @@ fun ScanConfigForm(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+        }
+
+        // ── Speed test (IP scan only) — runs after the scan on the IPs it found ──
+        if (kind == ScanKind.IP) {
+            item {
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Switch(
+                        checked = form.speedTestEnabled,
+                        onCheckedChange = { onFormChange(form.copy(speedTestEnabled = it)) },
+                    )
+                    Column {
+                        Text("Speed test", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "After this scan finds clean IPs, benchmark them and rank by download/upload speed and ping (uses extra data)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }

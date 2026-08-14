@@ -26,6 +26,7 @@ type ScanConfig struct {
 	// DNS resolver / tunnel scan (StartDNSScan) options.
 	DNSProtocol   string // "udp" | "tcp" | "both" | "all" (default "both"); "all" also probes DoT/DoH
 	DNSReference  string // truth-table reference resolver: "google" (default) | "cloudflare" | "quad9"
+	DNSScanDepth  string // "fast" skips NXDOMAIN hijack validation; "full" (default) runs every check
 	DNSTestNearby bool   // also expand + rescan the /24 around each tunnel-ready hit (disabled in LiteMode: multiplies scan size ~256x per hit)
 
 	// DNSTT end-to-end tunnel test (StartE2EScan) options. Targets carries the

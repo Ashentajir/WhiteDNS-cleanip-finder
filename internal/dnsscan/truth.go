@@ -1,7 +1,7 @@
 package dnsscan
 
 import (
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +11,21 @@ import (
 	"sync"
 	"time"
 )
+
+const (
+	truthFetchTimeout = 4 * time.Second
+	truthCacheTTL     = 30 * time.Minute
+)
+
+type truthCacheEntry struct {
+	table     *TruthTable
+	expiresAt time.Time
+}
+
+var truthCache = struct {
+	sync.Mutex
+	entries map[string]truthCacheEntry
+}{entries: make(map[string]truthCacheEntry)}
 
 // trustedDoHProvider defines a DoH endpoint for fetching the truth table.
 type trustedDoHProvider struct {
@@ -78,44 +93,73 @@ func (t *TruthTable) FetchTruth() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	ctx, cancel := context.WithTimeout(context.Background(), truthFetchTimeout)
+	defer cancel()
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: truthFetchTimeout,
 		Transport: &http.Transport{
-			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 			ForceAttemptHTTP2: true,
 		},
 	}
 
-	for _, provider := range orderedProviders(t.Prefer) {
-		req, err := http.NewRequest("GET", fmt.Sprintf(provider.URL, t.Domain), nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Accept", "application/dns-json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		resp.Body.Close()
-		if err != nil || resp.StatusCode != 200 {
-			continue
-		}
-
-		var dohResp dohJSONResponse
-		if err := json.Unmarshal(body, &dohResp); err != nil || dohResp.Status != 0 {
-			continue
-		}
-		for _, ans := range dohResp.Answer {
-			if ans.Type == 1 {
-				ip := strings.TrimSpace(ans.Data)
-				if net.ParseIP(ip) != nil {
-					t.TruthIPs[ip] = true
+	type providerResult struct {
+		name string
+		ips  []string
+	}
+	providers := orderedProviders(t.Prefer)
+	results := make(chan providerResult, len(providers))
+	for _, provider := range providers {
+		provider := provider
+		go func() {
+			result := providerResult{name: provider.Name}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(provider.URL, t.Domain), nil)
+			if err == nil {
+				req.Header.Set("Accept", "application/dns-json")
+				if resp, requestErr := client.Do(req); requestErr == nil {
+					body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8192))
+					resp.Body.Close()
+					var dohResp dohJSONResponse
+					if readErr == nil && resp.StatusCode == http.StatusOK && json.Unmarshal(body, &dohResp) == nil && dohResp.Status == 0 {
+						for _, ans := range dohResp.Answer {
+							if ans.Type == 1 && net.ParseIP(strings.TrimSpace(ans.Data)) != nil {
+								result.ips = append(result.ips, strings.TrimSpace(ans.Data))
+							}
+						}
+					}
 				}
 			}
+			results <- result
+		}()
+	}
+
+	answers := make(map[string][]string, len(providers))
+	for range providers {
+		select {
+		case result := <-results:
+			if len(result.ips) > 0 {
+				answers[result.name] = result.ips
+				// The first ordered provider is the user's preferred source. As
+				// soon as it succeeds there is no reason to wait for blocked
+				// fallback endpoints to exhaust their deadlines.
+				if result.name == providers[0].Name {
+					for _, ip := range result.ips {
+						t.TruthIPs[ip] = true
+					}
+					t.Provider = result.name
+					return nil
+				}
+			}
+		case <-ctx.Done():
+			goto chooseProvider
 		}
-		if len(t.TruthIPs) > 0 {
+	}
+
+chooseProvider:
+	for _, provider := range providers {
+		if ips := answers[provider.Name]; len(ips) > 0 {
+			for _, ip := range ips {
+				t.TruthIPs[ip] = true
+			}
 			t.Provider = provider.Name
 			return nil
 		}
@@ -134,6 +178,27 @@ func (t *TruthTable) FetchTruth() error {
 		return nil
 	}
 	return fmt.Errorf("truth table: all DoH providers failed and no fallback for %q", t.Domain)
+}
+
+// cachedTruthTable avoids repeating external truth-source lookups for every
+// mobile scan chunk or nearby-IP pass. Truth tables are immutable after fetch.
+func cachedTruthTable(domain, prefer string) *TruthTable {
+	key := strings.ToLower(strings.TrimSpace(domain)) + "\x00" + strings.ToLower(strings.TrimSpace(prefer))
+	now := time.Now()
+	truthCache.Lock()
+	entry, ok := truthCache.entries[key]
+	truthCache.Unlock()
+	if ok && now.Before(entry.expiresAt) {
+		return entry.table
+	}
+
+	table := NewTruthTable(domain)
+	table.Prefer = prefer
+	_ = table.FetchTruth() // best-effort; Verify treats missing truth as clean
+	truthCache.Lock()
+	truthCache.entries[key] = truthCacheEntry{table: table, expiresAt: now.Add(truthCacheTTL)}
+	truthCache.Unlock()
+	return table
 }
 
 // knownGoodV4Prefixes lists the /16 (first-two-octet) blocks a domain is known
