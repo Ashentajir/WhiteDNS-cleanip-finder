@@ -21,6 +21,20 @@ const screenDNSPorts = "dns_ports"
 // concurrency) after the transport is chosen and before the scan launches.
 const screenDNSWorkers = "dns_workers"
 
+// screenDNSDepth lets users trade the extra NXDOMAIN hijack validation for a
+// faster scan while retaining the core tunnel-readiness checks.
+const screenDNSDepth = "dns_depth"
+
+type dnsDepthPreset struct {
+	label string
+	depth string
+}
+
+var dnsDepthPresets = []dnsDepthPreset{
+	{"Fast - core A/RA/EDNS/TXT checks (skips hijack validation)", dnsscan.ScanDepthFast},
+	{"Full - core checks + NXDOMAIN hijack validation", dnsscan.ScanDepthFull},
+}
+
 // dnsWorkerPreset couples a menu label with a concurrency (worker count).
 type dnsWorkerPreset struct {
 	label   string
@@ -155,10 +169,45 @@ func (m tuiModel) handleDNSReferenceScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 		p := dnsReferencePresets[m.cursor]
 		m.dnsReference = p.provider
 		m.addLog(fmt.Sprintf("DNS scan reference resolver: %s", p.label))
+		m.pushScreen(screenDNSDepth)
+		m.cursor = 1 // preserve full validation by default
+	}
+	return m, nil
+}
+
+func (m tuiModel) handleDNSDepthScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < len(dnsDepthPresets)-1 {
+			m.cursor++
+		}
+	case "esc":
+		m.goBack()
+	case "enter":
+		p := dnsDepthPresets[m.cursor]
+		m.dnsScanDepth = p.depth
+		m.addLog(fmt.Sprintf("DNS scan depth: %s", p.label))
 		m.pushScreen(screenDNSWorkers)
 		m.cursor = 2 // default to the 64-worker preset
 	}
 	return m, nil
+}
+
+func (m tuiModel) viewDNSDepth(w, h int) string {
+	items := make([]string, len(dnsDepthPresets))
+	for i, p := range dnsDepthPresets {
+		items[i] = p.label
+	}
+	return m.viewList(w, h, "DNS SCAN DEPTH", items,
+		"↑↓ navigate  ·  Enter next  ·  Esc back")
 }
 
 // viewDNSReference renders the reference-resolver picker using the list style.
@@ -261,7 +310,11 @@ func (m tuiModel) launchDNSScan(targets []string) (tuiModel, tea.Cmd) {
 	m.startOperation() // pushes screenScanning + fresh scanCtx/counters
 	m.scanMsgCh = make(chan tea.Msg, 65536)
 	m.startScanLogFile("dnsscan", targets, nil, workers, 3*time.Second)
-	m.addLog(fmt.Sprintf("Starting DNS resolver/tunnel scan: targets=%d workers=%d", len(targets), workers))
+	depth := m.dnsScanDepth
+	if depth == "" {
+		depth = dnsscan.ScanDepthFull
+	}
+	m.addLog(fmt.Sprintf("Starting DNS resolver/tunnel scan: targets=%d workers=%d depth=%s", len(targets), workers, depth))
 	return m, m.cmdDNSScan(targets)
 }
 
@@ -297,6 +350,10 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 	if reference == "" {
 		reference = dnsscan.ReferenceGoogle
 	}
+	scanDepth := m.dnsScanDepth
+	if scanDepth == "" {
+		scanDepth = dnsscan.ScanDepthFull
+	}
 
 	return tea.Batch(
 		func() tea.Msg {
@@ -330,6 +387,7 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				Ports:         ports,
 				TestNearby:    testNearby,
 				TruthProvider: reference,
+				ScanDepth:     scanDepth,
 			}
 
 			var mu sync.Mutex
@@ -345,7 +403,9 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				trySend(logMsg{text: fmt.Sprintf("    detect RA=%v AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d EDNS=%v TXT=%v poison=%v hijack=%v(%s)",
 					r.RA, r.AA, r.TC, r.RD, r.RCodes, r.QDCount, r.ANCount, r.NSCount, r.ARCount,
 					r.EDNS, r.TxtPass, r.Poisoned, r.Transparent, r.HijackConfidence)})
-				if r.HijackReason != "" {
+				if r.HijackConfidence == "skipped" {
+					trySend(logMsg{text: "    hijack validation skipped (fast scan)"})
+				} else if r.HijackReason != "" {
 					trySend(logMsg{text: fmt.Sprintf("    hijack evidence=%s paths=udp:%v,tcp:%v checks=%d anomalies=%d rcodes=%s",
 						r.HijackReason, r.HijackUDP, r.HijackTCP, r.HijackChecks, r.HijackAnomalies, r.HijackRCodes)})
 				}

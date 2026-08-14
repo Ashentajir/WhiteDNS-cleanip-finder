@@ -1208,6 +1208,10 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 	default:
 		reference = dnsscan.ReferenceGoogle
 	}
+	scanDepth := strings.ToLower(strings.TrimSpace(cfg.DNSScanDepth))
+	if scanDepth != dnsscan.ScanDepthFast {
+		scanDepth = dnsscan.ScanDepthFull
+	}
 	testNearby := cfg.DNSTestNearby && !liteMode
 
 	opts := dnsscan.Options{
@@ -1217,6 +1221,7 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 		Protocol:      protocol,
 		Ports:         ports,
 		TruthProvider: reference,
+		ScanDepth:     scanDepth,
 	}
 
 	chunkSize := chunkIPCount
@@ -1283,8 +1288,8 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 			}
 		}
 
-		stagedMsg := fmt.Sprintf("[DNS-SCAN-START] targets=%d staged_ips=%d protocol=%s reference=%s concurrency=%d lite=%v nearby=%v",
-			len(targets), totalIPs, protocol, reference, conc, liteMode, testNearby)
+		stagedMsg := fmt.Sprintf("[DNS-SCAN-START] targets=%d staged_ips=%d protocol=%s depth=%s reference=%s concurrency=%d lite=%v nearby=%v",
+			len(targets), totalIPs, protocol, scanDepth, reference, conc, liteMode, testNearby)
 		lf.write(stagedMsg)
 		l.OnLog(stagedMsg)
 		flushReports() // create the folder + empty reports immediately, before any resolver completes

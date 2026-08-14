@@ -20,7 +20,8 @@ type Options struct {
 	Ports         []int         // custom ports; empty => 53(UDP/TCP) + 853(DoT) + 443(DoH)
 	Protocol      string        // "udp" | "tcp" | "both" | "all" (default "all" = incl DoT/DoH)
 	Concurrency   int           // resolver worker pool size (default 64)
-	TruthProvider string        // reference resolver for the truth table: "google" (default) | "cloudflare"
+	TruthProvider string        // reference resolver: "google" (default) | "cloudflare" | "quad9"
+	ScanDepth     string        // "fast" skips hijack probes; "full" (default) runs every check
 
 	// ScoreThreshold: resolvers with a compatibility Score >= this are considered
 	// "qualified" (range-scout parity). 0 keeps everything.
@@ -29,6 +30,11 @@ type Options struct {
 	// (range-scout "Test Nearby IPs").
 	TestNearby bool
 }
+
+const (
+	ScanDepthFast = "fast"
+	ScanDepthFull = "full"
+)
 
 func (o Options) withDefaults() Options {
 	if strings.TrimSpace(o.TargetDomain) == "" {
@@ -54,6 +60,12 @@ func (o Options) withDefaults() Options {
 		o.TruthProvider = strings.ToLower(strings.TrimSpace(o.TruthProvider))
 	default:
 		o.TruthProvider = ReferenceGoogle
+	}
+	switch strings.ToLower(strings.TrimSpace(o.ScanDepth)) {
+	case ScanDepthFast:
+		o.ScanDepth = ScanDepthFast
+	default:
+		o.ScanDepth = ScanDepthFull
 	}
 	return o
 }
@@ -229,9 +241,7 @@ func mergeHeaderSummary(result *ResolverResult, probe DnsProbeResult) {
 func ScanResolvers(ctx context.Context, ips []string, opts Options, progress func(done, total int, r ResolverResult)) []ResolverResult {
 	opts = opts.withDefaults()
 
-	truth := NewTruthTable(opts.TargetDomain)
-	truth.Prefer = opts.TruthProvider
-	_ = truth.FetchTruth() // best-effort; Verify() treats an empty table as clean
+	truth := cachedTruthTable(opts.TargetDomain, opts.TruthProvider)
 
 	dialer := &net.Dialer{Timeout: opts.Timeout}
 	dohClient := newDoHClient(opts.Timeout, dialer)
@@ -295,8 +305,6 @@ func ScanResolver(ctx context.Context, ip string, opts Options, truth *TruthTabl
 		return res
 	}
 
-	res.Probes = probeAllProtocols(ctx, ip, opts, truth, dialer, dohClient)
-
 	// TXT passthrough: query a domain that actually has TXT records (plain, not a
 	// random label — a nonexistent subdomain would NXDOMAIN and falsely fail
 	// every resolver) so we can tell whether the resolver forwards TXT rdata,
@@ -312,16 +320,23 @@ func ScanResolver(ctx context.Context, ip string, opts Options, truth *TruthTabl
 			}
 		}
 	}
-	switch txtProbeKind(opts, txtPort) {
-	case "tcp":
-		res.TxtProbe = ProbeTXTTCP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
-	case "dot":
-		res.TxtProbe = ProbeTXTDoT(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
-	case "doh":
-		res.TxtProbe = ProbeTXTDoH(ctx, ip, opts.TxtDomain, opts.Timeout, dohClient, txtPort)
-	default:
-		res.TxtProbe = ProbeTXTUDP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
-	}
+	// The A/transport probes and TXT passthrough probe are independent. Running
+	// them together prevents their timeouts from stacking for dead resolvers.
+	txtResult := make(chan DnsProbeResult, 1)
+	go func() {
+		switch txtProbeKind(opts, txtPort) {
+		case "tcp":
+			txtResult <- ProbeTXTTCP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
+		case "dot":
+			txtResult <- ProbeTXTDoT(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
+		case "doh":
+			txtResult <- ProbeTXTDoH(ctx, ip, opts.TxtDomain, opts.Timeout, dohClient, txtPort)
+		default:
+			txtResult <- ProbeTXTUDP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
+		}
+	}()
+	res.Probes = probeAllProtocols(ctx, ip, opts, truth, dialer, dohClient)
+	res.TxtProbe = <-txtResult
 	res.TxtPass = res.TxtProbe.Responded && len(res.TxtProbe.AnswerTXT) > 0
 
 	best := time.Duration(0)
@@ -399,7 +414,7 @@ func ScanResolver(ctx context.Context, ip string, opts Options, truth *TruthTabl
 	// Reserved-name checks run concurrently over every working Do53 transport.
 	// This catches A redirects, CNAME/answer rewriting, repeated NOERROR/NODATA,
 	// and UDP-only injection while adding at most one timeout to the scan.
-	if res.Responded {
+	if res.Responded && opts.ScanDepth == ScanDepthFull {
 		hijack := detectHijack(ctx, ip, opts.Timeout, dialer, txtPort, res.UDPOK, res.TCPOK)
 		res.Transparent = hijack.Hijacked
 		res.HijackIP = strings.Join(hijack.IPs, ",")
@@ -410,6 +425,9 @@ func ScanResolver(ctx context.Context, ip string, opts Options, truth *TruthTabl
 		res.HijackChecks = hijack.Checks
 		res.HijackAnomalies = hijack.Anomalies
 		res.HijackRCodes = strings.Join(hijack.RCodes, ",")
+	} else if opts.ScanDepth == ScanDepthFast {
+		res.HijackConfidence = "skipped"
+		res.HijackReason = "fast-scan"
 	}
 
 	res.Score = computeScore(res)
@@ -446,7 +464,7 @@ func computeScore(r ResolverResult) int {
 // selected transports (opts.Protocol: udp/tcp/both/all).
 func probeAllProtocols(ctx context.Context, ip string, opts Options, truth *TruthTable, dialer *net.Dialer, dohClient *http.Client) []DnsProbeResult {
 	domain := opts.TargetDomain
-	out := make([]DnsProbeResult, 0, 8)
+	probes := make([]func() DnsProbeResult, 0, 8)
 
 	wantUDP, wantTCP, wantEnc := protocolProbePlan(opts.Protocol)
 
@@ -459,20 +477,45 @@ func probeAllProtocols(ctx context.Context, ip string, opts Options, truth *Trut
 	}
 
 	for _, p := range ports {
+		port := p
 		if wantUDP && p != 853 && p != 443 {
-			out = append(out, ProbeUDP(ctx, ip, domain, truth, opts.Timeout, dialer, p))
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeUDP(ctx, ip, domain, truth, opts.Timeout, dialer, port)
+			})
 		}
 		if wantTCP && p != 853 && p != 443 {
-			out = append(out, ProbeTCP(ctx, ip, domain, truth, opts.Timeout, dialer, p))
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeTCP(ctx, ip, domain, truth, opts.Timeout, dialer, port)
+			})
 		}
 		if wantEnc && p == 853 {
-			out = append(out, ProbeDoT(ctx, ip, domain, truth, opts.Timeout, dialer, p))
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeDoT(ctx, ip, domain, truth, opts.Timeout, dialer, port)
+			})
 		}
 		if wantEnc && p == 443 {
-			out = append(out, ProbeDoH(ctx, ip, domain, truth, opts.Timeout, dohClient, p))
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeDoH(ctx, ip, domain, truth, opts.Timeout, dohClient, port)
+			})
 		}
 	}
-	return out
+	return runProbesConcurrently(probes)
+}
+
+// runProbesConcurrently preserves the configured probe order while preventing
+// slow or blocked transports from serially adding their timeout to every IP.
+func runProbesConcurrently(probes []func() DnsProbeResult) []DnsProbeResult {
+	results := make([]DnsProbeResult, len(probes))
+	var wg sync.WaitGroup
+	for i, probe := range probes {
+		wg.Add(1)
+		go func(index int, run func() DnsProbeResult) {
+			defer wg.Done()
+			results[index] = run()
+		}(i, probe)
+	}
+	wg.Wait()
+	return results
 }
 
 func protocolProbePlan(protocol string) (udp, tcp, encrypted bool) {
