@@ -2,7 +2,7 @@
   "RT_GROUP_ICON": {
     "APP": {
       "0000": [
-        "whitedns-icon-256.png"
+        "../../../outputs/app-icon-pack/windows/app_icon_256.png"
       ]
     }
   },
