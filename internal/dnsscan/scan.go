@@ -74,7 +74,8 @@ func (o Options) withDefaults() Options {
 type ResolverResult struct {
 	IP                    string
 	Probes                []DnsProbeResult // per-protocol A-record probes
-	TxtProbe              DnsProbeResult   // TXT passthrough probe
+	TxtProbe              DnsProbeResult   // best TXT passthrough probe (compatibility/reporting)
+	TxtProbes             []DnsProbeResult // TXT probes for every selected transport
 	Responded             bool
 	UDPOK                 bool          // responded over UDP
 	TCPOK                 bool          // responded over TCP
@@ -96,7 +97,8 @@ type ResolverResult struct {
 	TxtPass               bool          // TXT rdata returned intact
 	Transparent           bool          // transparent DNS proxy / lying resolver detected
 	Score                 int           // SlipNet-style compatibility score 0-6
-	TunnelReady           bool          // RA + EDNS + TXT passthrough
+	TunnelReady           bool          // at least one clean transport can recurse and pass TXT
+	TunnelTransport       string        // transport selected for tunneling: udp | tcp | dot | doh
 	TunnelReason          string        // why ready / what's missing
 	BestLatency           time.Duration // fastest responding probe
 	Nearby                bool          // discovered via /24 nearby-expansion pass
@@ -122,20 +124,38 @@ const (
 	StatusInvalid = "invalid" // no usable response at all
 )
 
-// classifyStatus collapses the per-resolver flags into a single state. Order of
-// precedence: no response (invalid) → forged answers (poison) → transparent
-// interception (hijack) → honest (valid).
+// classifyStatus collapses the per-resolver flags into a single state. A dirty
+// UDP path does not condemn a clean TCP/DoT/DoH path: this matters on networks
+// that inject only UDP/53. Poison therefore means every responding A-record
+// path failed integrity, while the per-transport poison fields retain evidence
+// about mixed results.
 func classifyStatus(r ResolverResult) string {
 	switch {
 	case !r.Responded:
 		return StatusInvalid
 	case r.Transparent:
 		return StatusHijack
-	case r.Poisoned:
+	case !hasCleanAPath(r.Probes):
 		return StatusPoison
 	default:
 		return StatusValid
 	}
+}
+
+func hasCleanAPath(probes []DnsProbeResult) bool {
+	for _, probe := range probes {
+		if probe.HeaderOK && !probe.IsPoisoned {
+			return true
+		}
+	}
+	return false
+}
+
+// Passed is the canonical resolver acceptance rule shared by desktop, Android,
+// nearby expansion, and report files. TunnelReady already selects a clean
+// transport; StatusValid additionally rejects resolver-wide NXDOMAIN hijacking.
+func (r ResolverResult) Passed() bool {
+	return r.TunnelReady && r.Status == StatusValid
 }
 
 // StatusColor maps a resolver status to the report colour requested by the
@@ -157,7 +177,7 @@ func StatusColor(status string) string {
 // NS, and AR already have aggregate result fields, so they are intentionally
 // omitted here instead of repeating the full raw DNS header.
 func (r ResolverResult) HeaderDump() []string {
-	lines := make([]string, 0, len(r.Probes)+1)
+	lines := make([]string, 0, len(r.Probes)+len(r.TxtProbes)+1)
 	for _, p := range r.Probes {
 		if !p.HeaderOK {
 			line := fmt.Sprintf("%-8s no-header", p.Protocol)
@@ -188,8 +208,11 @@ func (r ResolverResult) HeaderDump() []string {
 		}
 		lines = append(lines, line)
 	}
-	if r.TxtProbe.Protocol != "" {
-		p := r.TxtProbe
+	txtProbes := r.TxtProbes
+	if len(txtProbes) == 0 && r.TxtProbe.Protocol != "" {
+		txtProbes = []DnsProbeResult{r.TxtProbe}
+	}
+	for _, p := range txtProbes {
 		protocol := "TXT/" + p.Protocol
 		if !p.HeaderOK {
 			line := fmt.Sprintf("%-8s no-header", protocol)
@@ -320,24 +343,16 @@ func ScanResolver(ctx context.Context, ip string, opts Options, truth *TruthTabl
 			}
 		}
 	}
-	// The A/transport probes and TXT passthrough probe are independent. Running
+	// The A/transport probes and TXT passthrough probes are independent. Running
 	// them together prevents their timeouts from stacking for dead resolvers.
-	txtResult := make(chan DnsProbeResult, 1)
+	txtResult := make(chan []DnsProbeResult, 1)
 	go func() {
-		switch txtProbeKind(opts, txtPort) {
-		case "tcp":
-			txtResult <- ProbeTXTTCP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
-		case "dot":
-			txtResult <- ProbeTXTDoT(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
-		case "doh":
-			txtResult <- ProbeTXTDoH(ctx, ip, opts.TxtDomain, opts.Timeout, dohClient, txtPort)
-		default:
-			txtResult <- ProbeTXTUDP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, txtPort)
-		}
+		txtResult <- probeTXTProtocols(ctx, ip, opts, dialer, dohClient)
 	}()
 	res.Probes = probeAllProtocols(ctx, ip, opts, truth, dialer, dohClient)
-	res.TxtProbe = <-txtResult
-	res.TxtPass = res.TxtProbe.Responded && len(res.TxtProbe.AnswerTXT) > 0
+	res.TxtProbes = <-txtResult
+	res.TxtProbe = bestTXTProbe(res.TxtProbes)
+	res.TxtPass = txtProbePassed(res.TxtProbe)
 
 	best := time.Duration(0)
 	var udpLatency, tcpLatency time.Duration
@@ -431,7 +446,7 @@ func ScanResolver(ctx context.Context, ip string, opts Options, truth *TruthTabl
 	}
 
 	res.Score = computeScore(res)
-	res.TunnelReady, res.TunnelReason = classifyTunnel(res)
+	res.TunnelReady, res.TunnelTransport, res.TunnelReason = classifyTunnel(res)
 	res.Status = classifyStatus(res)
 	return res
 }
@@ -502,6 +517,67 @@ func probeAllProtocols(ctx context.Context, ip string, opts Options, truth *Trut
 	return runProbesConcurrently(probes)
 }
 
+// probeTXTProtocols tests TXT forwarding on every selected transport. The old
+// single-UDP probe produced false negatives when UDP was injected, stripped, or
+// legitimately truncated while TCP/53 remained fully usable for tunneling.
+func probeTXTProtocols(ctx context.Context, ip string, opts Options, dialer *net.Dialer, dohClient *http.Client) []DnsProbeResult {
+	wantUDP, wantTCP, wantEnc := protocolProbePlan(opts.Protocol)
+	ports := opts.Ports
+	if len(ports) == 0 {
+		ports = []int{53}
+		if wantEnc {
+			ports = []int{53, 853, 443}
+		}
+	}
+	probes := make([]func() DnsProbeResult, 0, 8)
+	for _, p := range ports {
+		port := p
+		if wantUDP && port != 853 && port != 443 {
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeTXTUDP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, port)
+			})
+		}
+		if wantTCP && port != 853 && port != 443 {
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeTXTTCP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, port)
+			})
+		}
+		if wantEnc && port == 853 {
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeTXTDoT(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, port)
+			})
+		}
+		if wantEnc && port == 443 {
+			probes = append(probes, func() DnsProbeResult {
+				return ProbeTXTDoH(ctx, ip, opts.TxtDomain, opts.Timeout, dohClient, port)
+			})
+		}
+	}
+	return runProbesConcurrently(probes)
+}
+
+func txtProbePassed(probe DnsProbeResult) bool {
+	return probe.Responded && len(probe.AnswerTXT) > 0
+}
+
+func bestTXTProbe(probes []DnsProbeResult) DnsProbeResult {
+	var best DnsProbeResult
+	for _, probe := range probes {
+		if txtProbePassed(probe) && (!txtProbePassed(best) || best.TTFB <= 0 || (probe.TTFB > 0 && probe.TTFB < best.TTFB)) {
+			best = probe
+		}
+	}
+	if txtProbePassed(best) {
+		return best
+	}
+	for _, probe := range probes {
+		if best.Protocol == "" || (probe.HeaderOK && !best.HeaderOK) {
+			best = probe
+		}
+	}
+	return best
+}
+
 // runProbesConcurrently preserves the configured probe order while preventing
 // slow or blocked transports from serially adding their timeout to every IP.
 func runProbesConcurrently(probes []func() DnsProbeResult) []DnsProbeResult {
@@ -547,26 +623,71 @@ func txtProbeKind(opts Options, port int) string {
 	return "udp"
 }
 
-// classifyTunnel decides tunnel suitability: open recursion (RA) + EDNS0 + TXT
-// passthrough. Poisoning is reported separately and never disqualifies.
-func classifyTunnel(r ResolverResult) (bool, string) {
+// classifyTunnel selects one transport that has a clean A response, recursion,
+// and TXT passthrough. UDP additionally requires EDNS0 for usable payload size;
+// stream transports do not. This allows a clean TCP path to pass when UDP/53 is
+// poisoned or a large UDP TXT response is truncated.
+func classifyTunnel(r ResolverResult) (bool, string, string) {
 	if !r.Responded {
-		return false, "no-response"
+		return false, "", "no-response"
 	}
-	var missing []string
-	if !r.RA {
-		missing = append(missing, "no-recursion(RA=0)")
+	cleanResponse, cleanRecursor, txtOnCleanRecursor, udpNeedsEDNS := false, false, false, false
+	for _, probe := range r.Probes {
+		if !probe.HeaderOK || probe.IsPoisoned {
+			continue
+		}
+		cleanResponse = true
+		if !probe.Header.RA {
+			continue
+		}
+		cleanRecursor = true
+		for _, txt := range r.TxtProbes {
+			if txt.Protocol != probe.Protocol || !txtProbePassed(txt) {
+				continue
+			}
+			txtOnCleanRecursor = true
+			transport := transportName(probe.Protocol)
+			if transport == "udp" && !probe.EDNS && !txt.EDNS {
+				udpNeedsEDNS = true
+				continue
+			}
+			reason := "clean-" + transport + "+recursion+txt-passthrough"
+			if transport == "udp" {
+				reason += "+edns0"
+			}
+			return true, transport, reason
+		}
 	}
-	if !r.EDNS {
-		missing = append(missing, "no-edns0")
+	switch {
+	case !cleanResponse:
+		return false, "", "no-clean-answer-path"
+	case !cleanRecursor:
+		return false, "", "no-recursion(RA=0)"
+	case !r.TxtPass:
+		return false, "", "no-txt-passthrough"
+	case udpNeedsEDNS:
+		return false, "", "no-edns0-on-udp-path"
+	case !txtOnCleanRecursor:
+		return false, "", "no-txt-on-clean-recursive-transport"
+	default:
+		return false, "", "no-tunnel-capable-transport"
 	}
-	if !r.TxtPass {
-		missing = append(missing, "no-txt-passthrough")
+}
+
+func transportName(protocol string) string {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	switch {
+	case strings.HasPrefix(protocol, "udp"):
+		return "udp"
+	case strings.HasPrefix(protocol, "tcp"):
+		return "tcp"
+	case strings.HasPrefix(protocol, "dot"):
+		return "dot"
+	case strings.HasPrefix(protocol, "doh"):
+		return "doh"
+	default:
+		return protocol
 	}
-	if len(missing) == 0 {
-		return true, "open-recursor+edns0+txt-passthrough"
-	}
-	return false, strings.Join(missing, ",")
 }
 
 // detectHijack probes the resolver with independent, guaranteed-nonexistent

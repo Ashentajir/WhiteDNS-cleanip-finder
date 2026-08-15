@@ -155,6 +155,9 @@ func WriteReports(dir string, results []ResolverResult) (ReportPaths, error) {
 func sortedResults(results []ResolverResult) []ResolverResult {
 	sorted := append([]ResolverResult(nil), results...)
 	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Passed() != sorted[j].Passed() {
+			return sorted[i].Passed()
+		}
 		if sorted[i].Score != sorted[j].Score {
 			return sorted[i].Score > sorted[j].Score // best first
 		}
@@ -179,7 +182,7 @@ func writeMobileDetailedReport(path string, results []ResolverResult) error {
 	fmt.Fprintf(&b, "WhiteDNS Android DNS Results\nGenerated: %s\nTotal scanned: %d\n", time.Now().Format("2006-01-02 15:04:05"), len(results))
 	fmt.Fprintf(&b, "Passed: %d  Poison: %d  Hijack: %d  Other/failed: %d\n",
 		passed, c[StatusPoison], c[StatusHijack], other)
-	b.WriteString("Passed means clean + tunnel-ready, with no poisoning or hijack detected.\n")
+	b.WriteString("Passed means at least one clean tunnel-capable transport, with no resolver-wide hijack detected.\n")
 
 	writeSection := func(title string, count int, include func(ResolverResult) bool) {
 		fmt.Fprintf(&b, "\n[%s] %d\n%s\n", title, count, strings.Repeat("=", 72))
@@ -187,8 +190,8 @@ func writeMobileDetailedReport(path string, results []ResolverResult) error {
 			if !include(r) {
 				continue
 			}
-			fmt.Fprintf(&b, "%s  score=%d/6  latency=%dms  tunnel=%v  nearby=%v\n",
-				r.IP, r.Score, r.BestLatency.Milliseconds(), r.TunnelReady, r.Nearby)
+			fmt.Fprintf(&b, "%s  score=%d/6  latency=%dms  tunnel=%v  via=%s  nearby=%v\n",
+				r.IP, r.Score, r.BestLatency.Milliseconds(), r.TunnelReady, r.TunnelTransport, r.Nearby)
 			fmt.Fprintf(&b, "  UDP=%v TCP=%v RA=%v EDNS0=%v TXT-pass=%v reason=%s\n",
 				r.UDPOK, r.TCPOK, r.RA, r.EDNS, r.TxtPass, r.TunnelReason)
 			fmt.Fprintf(&b, "  DNS detection: AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d\n",
@@ -219,7 +222,7 @@ func writeMobileDetailedReport(path string, results []ResolverResult) error {
 }
 
 func mobilePassed(r ResolverResult) bool {
-	return r.Status == StatusValid && r.TunnelReady
+	return r.Passed()
 }
 
 func writeMobilePassedList(path string, results []ResolverResult) error {
@@ -244,8 +247,8 @@ func writeFullReport(path string, results []ResolverResult) error {
 	b.WriteString(strings.Repeat("=", 90))
 	b.WriteString("\n")
 	for _, r := range results {
-		fmt.Fprintf(&b, "\n%-21s [%s] score=%d/6 tunnel=%s poison=%v hijack=%v %dms\n",
-			r.IP, strings.ToUpper(r.Status), r.Score, ynb(r.TunnelReady), r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
+		fmt.Fprintf(&b, "\n%-21s [%s] score=%d/6 tunnel=%s via=%s poison=%v hijack=%v %dms\n",
+			r.IP, strings.ToUpper(r.Status), r.Score, ynb(r.TunnelReady), r.TunnelTransport, r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
 		fmt.Fprintf(&b, "    RA=%v EDNS0=%v TXT-pass=%v UDP=%v TCP=%v reason=%s\n",
 			r.RA, r.EDNS, r.TxtPass, r.UDPOK, r.TCPOK, r.TunnelReason)
 		fmt.Fprintf(&b, "    DNS detection: AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d\n",
@@ -272,30 +275,29 @@ func writeFullReport(path string, results []ResolverResult) error {
 
 func writeTunnelReport(path string, results []ResolverResult) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Tunnel-Ready DNS Resolvers\nGenerated: %s\n", time.Now().Format("2006-01-02 15:04:05"))
-	b.WriteString("Criteria: open recursion (RA) + EDNS0 large-payload + TXT passthrough\n")
+	fmt.Fprintf(&b, "Passed DNS Tunnel Resolvers\nGenerated: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	b.WriteString("Criteria: one clean recursive transport with TXT passthrough; UDP additionally requires EDNS0\n")
 	b.WriteString(strings.Repeat("=", 70))
 	b.WriteString("\n")
 	count := 0
 	for _, r := range results {
-		if !r.TunnelReady {
+		if !r.Passed() {
 			continue
 		}
 		count++
-		fmt.Fprintf(&b, "%-21s score=%d/6 poison=%v transparent=%v %dms\n",
-			r.IP, r.Score, r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
+		fmt.Fprintf(&b, "%-21s score=%d/6 via=%s poison=%v transparent=%v %dms\n",
+			r.IP, r.Score, r.TunnelTransport, r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
 	}
-	fmt.Fprintf(&b, "\nTotal tunnel-ready: %d\n", count)
+	fmt.Fprintf(&b, "\nTotal passed: %d\n", count)
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-// writePassedList dumps just the IPs of clean (valid) resolvers — one per line,
-// no headers or extra text — so the passed list can be pasted straight into a
-// client/config. "Clean" = responded honestly (not poison / hijack / invalid).
+// writePassedList dumps only resolvers accepted by the canonical tunnel rule,
+// one per line with no headers, ready for a client/config or E2E validation.
 func writePassedList(path string, results []ResolverResult) error {
 	var b strings.Builder
 	for _, r := range results {
-		if r.Status == StatusValid {
+		if r.Passed() {
 			b.WriteString(r.IP)
 			b.WriteString("\n")
 		}
@@ -303,13 +305,12 @@ func writePassedList(path string, results []ResolverResult) error {
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-// writeTunnelReadyIPList dumps just the IPs of tunnel-ready resolvers — one per
-// line, no headers — so the shortlist can be fed directly into the DNSTT
-// end-to-end test (StartE2EScan / the TUI E2E flow) as clean targets.
+// writeTunnelReadyIPList dumps the same canonical passed shortlist under the
+// legacy tunnel-ready filename used by the DNSTT E2E flow.
 func writeTunnelReadyIPList(path string, results []ResolverResult) error {
 	var b strings.Builder
 	for _, r := range results {
-		if r.TunnelReady {
+		if r.Passed() {
 			b.WriteString(r.IP)
 			b.WriteString("\n")
 		}

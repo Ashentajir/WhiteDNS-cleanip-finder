@@ -86,7 +86,7 @@ private val DNS_TRANSPORT_PRESETS = listOf(
 
 private data class DnsDepthPreset(val label: String, val value: String)
 private val DNS_DEPTH_PRESETS = listOf(
-    DnsDepthPreset("Fast - core A/RA/EDNS/TXT checks", "fast"),
+    DnsDepthPreset("Fast - transport-aware A/RA/TXT checks", "fast"),
     DnsDepthPreset("Full - also detect NXDOMAIN hijacking", "full"),
 )
 

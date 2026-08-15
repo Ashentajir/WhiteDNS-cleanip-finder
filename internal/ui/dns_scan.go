@@ -31,7 +31,7 @@ type dnsDepthPreset struct {
 }
 
 var dnsDepthPresets = []dnsDepthPreset{
-	{"Fast - core A/RA/EDNS/TXT checks (skips hijack validation)", dnsscan.ScanDepthFast},
+	{"Fast - transport-aware A/RA/TXT checks (skips hijack validation)", dnsscan.ScanDepthFast},
 	{"Full - core checks + NXDOMAIN hijack validation", dnsscan.ScanDepthFull},
 }
 
@@ -397,9 +397,9 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				if r.Responded {
 					status = fmt.Sprintf("resp %dms", r.BestLatency.Milliseconds())
 				}
-				trySend(logMsg{text: fmt.Sprintf("%-21s %-13s score=%d/6 path=%s/%s tunnel=%v (%s)",
+				trySend(logMsg{text: fmt.Sprintf("%-21s %-13s score=%d/6 path=%s/%s tunnel=%v via=%s (%s)",
 					r.IP, status, r.Score, r.PreferredTransport, r.FallbackTransport,
-					r.TunnelReady, r.TunnelReason)})
+					r.TunnelReady, r.TunnelTransport, r.TunnelReason)})
 				trySend(logMsg{text: fmt.Sprintf("    detect RA=%v AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d EDNS=%v TXT=%v poison=%v hijack=%v(%s)",
 					r.RA, r.AA, r.TC, r.RD, r.RCodes, r.QDCount, r.ANCount, r.NSCount, r.ARCount,
 					r.EDNS, r.TxtPass, r.Poisoned, r.Transparent, r.HijackConfidence)})
@@ -413,7 +413,7 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 					trySend(logMsg{text: "    " + hd})
 				}
 				mu.Lock()
-				if r.TunnelReady {
+				if r.Passed() {
 					hits++
 				}
 				h := hits
@@ -432,7 +432,7 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				}
 				var nearby []string
 				for _, r := range all {
-					if !r.TunnelReady {
+					if !r.Passed() {
 						continue
 					}
 					for _, nip := range dnsscan.NearbyIPs(r.IP) {
@@ -469,15 +469,15 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 			// Build the on-screen shortlist (tunnel-ready, best score first).
 			var tunnelReady []string
 			for _, r := range all {
-				if !r.TunnelReady {
+				if !r.Passed() {
 					continue
 				}
 				tag := ""
 				if r.Nearby {
 					tag = " [nearby]"
 				}
-				tunnelReady = append(tunnelReady, fmt.Sprintf("%-21s score=%d/6 poison=%v transparent=%v%s",
-					r.IP, r.Score, r.Poisoned, r.Transparent, tag))
+				tunnelReady = append(tunnelReady, fmt.Sprintf("%-21s score=%d/6 via=%s poison=%v transparent=%v%s",
+					r.IP, r.Score, r.TunnelTransport, r.Poisoned, r.Transparent, tag))
 			}
 			trySend(logMsg{text: fmt.Sprintf("[DNS] done: %d tunnel-ready of %d scanned", len(tunnelReady), len(all))})
 			close(ch)

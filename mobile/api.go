@@ -1298,7 +1298,7 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 		// dnsscan.ScanResolvers doc), so passedTotal/processedBase need no locking.
 		makeProgress := func(totalForETA int) func(done, tot int, r dnsscan.ResolverResult) {
 			return func(done, _ int, r dnsscan.ResolverResult) {
-				passed := r.TunnelReady && r.Status == dnsscan.StatusValid
+				passed := r.Passed()
 				if passed {
 					passedTotal++
 				}
@@ -1309,8 +1309,8 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 				if r.Responded {
 					status = fmt.Sprintf("resp %dms", r.BestLatency.Milliseconds())
 				}
-				line := fmt.Sprintf("%-15s %-13s verdict=%s score=%d/6 tunnel=%v (%s)",
-					r.IP, status, r.Status, r.Score, r.TunnelReady, r.TunnelReason)
+				line := fmt.Sprintf("%-15s %-13s verdict=%s score=%d/6 tunnel=%v via=%s (%s)",
+					r.IP, status, r.Status, r.Score, r.TunnelReady, r.TunnelTransport, r.TunnelReason)
 				line += fmt.Sprintf(" path=%s fallback=%s udp_poison=%v tcp_poison=%v",
 					r.PreferredTransport, r.FallbackTransport, r.UDPPoisoned, r.TCPPoisoned)
 				if r.PoisonIP != "" {
@@ -1400,7 +1400,7 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 			}
 			var nearby []string
 			for _, r := range all {
-				if !r.TunnelReady {
+				if !r.Passed() {
 					continue
 				}
 				for _, nip := range dnsscan.NearbyIPs(r.IP) {
