@@ -76,8 +76,10 @@ jobs:
           go install golang.org/x/mobile/cmd/gobind@$GOMOBILE_VERSION
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
-      - name: gomobile init
-        run: gomobile init
+      # gomobile init installs gobind@latest internally. Create its workspace
+      # directly because gobind is already installed at GOMOBILE_VERSION above.
+      - name: Initialize gomobile workspace
+        run: mkdir -p "$(go env GOPATH)/pkg/gomobile"
 
       # â”€â”€ 7. Register gomobile as a tool dep (required by Go 1.25+) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       - name: Add gomobile tool dependency
