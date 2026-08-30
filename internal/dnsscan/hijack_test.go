@@ -60,9 +60,38 @@ func TestExpandedXLSXUsesValidColumnsBeyondZ(t *testing.T) {
 		}
 		sheet = string(data)
 	}
-	for _, want := range []string{`dimension ref="A1:AC2"`, "Confidence", "Hijack evidence", "forged-a;stable-redirect"} {
+	for _, want := range []string{`dimension ref="A1:AI2"`, "AA", "RCODE", "QD", "AN", "Confidence", "Hijack evidence", "forged-a;stable-redirect"} {
 		if !strings.Contains(sheet, want) {
 			t.Errorf("XLSX sheet missing %q", want)
+		}
+	}
+}
+
+func TestHeaderSummaryAndDumpStayCompact(t *testing.T) {
+	result := ResolverResult{
+		Probes: []DnsProbeResult{{
+			Protocol: "UDP/53",
+			HeaderOK: true,
+			Header: DnsHeader{
+				ID: 0x1234, QR: true, AA: true, RD: true, RA: true,
+				Rcode: 0, QDCount: 1, ANCount: 2, NSCount: 3, ARCount: 4,
+			},
+			AnswerIPs: []string{"192.0.2.1"},
+		}},
+	}
+	mergeHeaderSummary(&result, result.Probes[0])
+	if !result.AA || result.TC || !result.RD || result.RCodes != "UDP/53=0" || result.QDCount != 1 || result.ANCount != 2 {
+		t.Fatalf("unexpected aggregate header summary: %+v", result)
+	}
+	dump := strings.Join(result.HeaderDump(), "\n")
+	for _, want := range []string{"aa=Y", "tc=N", "rd=Y", "rcode=0", "qd=1", "an=2", "answer=192.0.2.1"} {
+		if !strings.Contains(dump, want) {
+			t.Errorf("compact probe details missing %q: %s", want, dump)
+		}
+	}
+	for _, duplicated := range []string{"id=", "qr=", "ra=", "ns=", "ar="} {
+		if strings.Contains(dump, duplicated) {
+			t.Errorf("compact probe details repeat %q: %s", duplicated, dump)
 		}
 	}
 }
@@ -120,6 +149,7 @@ func TestCSVAndHTMLContainTransportAndHijackEvidence(t *testing.T) {
 		IP: "192.0.2.53", Status: StatusHijack, Responded: true,
 		UDPOK: true, TCPOK: true, PreferredTransport: "tcp", FallbackTransport: "udp",
 		UDPPoisoned: true, TransportDisagreement: true, InjectionObserved: true,
+		RA: true, AA: true, TC: true, RD: true, RCodes: "UDP/53=0,TCP/53=2", QDCount: 1, ANCount: 2,
 		Transparent: true, HijackConfidence: "high", HijackReason: "forged-a;transport-specific",
 		HijackUDP: true, HijackChecks: 4, HijackAnomalies: 2, HijackRCodes: "tcp:3,udp:0",
 		HijackIP: "10.10.34.34",
@@ -143,7 +173,7 @@ func TestCSVAndHTMLContainTransportAndHijackEvidence(t *testing.T) {
 	}
 	header := strings.Join(rows[0], ",")
 	values := strings.Join(rows[1], ",")
-	for _, want := range []string{"preferred_transport", "udp_poisoned", "injection_observed", "hijack_confidence", "hijack_reason", "hijack_rcodes"} {
+	for _, want := range []string{"preferred_transport", "udp_poisoned", "injection_observed", "aa", "tc", "rd", "rcodes", "qd_records", "an_records", "hijack_confidence", "hijack_reason", "hijack_rcodes"} {
 		if !strings.Contains(header, want) {
 			t.Errorf("CSV header missing %q: %s", want, header)
 		}
@@ -158,9 +188,18 @@ func TestCSVAndHTMLContainTransportAndHijackEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(htmlBody)
-	for _, want := range []string{"Preferred", "UDP poison", "Injection", "Confidence", "Hijack evidence", "forged-a;transport-specific"} {
+	for _, want := range []string{"Preferred", "UDP poison", "Injection", "AA", "TC", "RD", "RCODE", "QD", "AN", "Confidence", "Hijack evidence", "forged-a;transport-specific"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("HTML missing %q", want)
 		}
+	}
+	if strings.Contains(body, "Headers (qr/aa/tc/rd/ra rcode qd/an/ns/ar)") {
+		t.Error("HTML still contains the unreadable full-header column")
+	}
+	if got, want := strings.Count(body, "<th>"), 35; got != want {
+		t.Errorf("HTML has %d headers, want %d", got, want)
+	}
+	if got, want := strings.Count(body, "<td"), 35; got != want {
+		t.Errorf("HTML row has %d cells, want %d", got, want)
 	}
 }

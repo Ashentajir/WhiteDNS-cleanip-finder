@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,8 +33,12 @@ type DnsProbeResult struct {
 
 // ProbeUDP sends a DNS A query over UDP (with EDNS0→bare fallback).
 func ProbeUDP(ctx context.Context, resolverIP, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
+	return probeUDP(ctx, resolverIP, domain, truth, timeout, dialer, port, true)
+}
+
+func probeUDP(ctx context.Context, resolverIP, domain string, truth *TruthTable, timeout time.Duration, dialer *net.Dialer, port int, allowFallback bool) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("UDP/%d", port)}
-	hdr, ips, edns, ttfb, injected, err := probeUDPWithFallback(ctx, resolverIP, domain, 1, timeout, dialer, port, truth != nil)
+	hdr, ips, edns, ttfb, injected, err := probeUDPWithFallback(ctx, resolverIP, domain, 1, timeout, dialer, port, truth != nil, allowFallback)
 	result.TTFB = ttfb
 	result.InjectionObserved = injected
 	if err != nil {
@@ -173,8 +178,12 @@ func ProbeDoH(ctx context.Context, resolverIP, domain string, truth *TruthTable,
 
 // ProbeTXTUDP sends a TXT query over UDP (with EDNS0→bare fallback).
 func ProbeTXTUDP(ctx context.Context, resolverIP, queryName string, timeout time.Duration, dialer *net.Dialer, port int) DnsProbeResult {
+	return probeTXTUDP(ctx, resolverIP, queryName, timeout, dialer, port, true)
+}
+
+func probeTXTUDP(ctx context.Context, resolverIP, queryName string, timeout time.Duration, dialer *net.Dialer, port int, allowFallback bool) DnsProbeResult {
 	result := DnsProbeResult{Protocol: fmt.Sprintf("UDP/%d", port)}
-	hdr, txts, edns, ttfb, injected, err := probeUDPWithFallback(ctx, resolverIP, queryName, 16, timeout, dialer, port, false)
+	hdr, txts, edns, ttfb, injected, err := probeUDPWithFallback(ctx, resolverIP, queryName, 16, timeout, dialer, port, false, allowFallback)
 	result.TTFB = ttfb
 	result.InjectionObserved = injected
 	if err != nil {
@@ -277,7 +286,7 @@ func ProbeTXTDoH(ctx context.Context, resolverIP, queryName string, timeout time
 // traffic, so poisoned/broken resolvers are still observed rather than timing
 // out. Returns header, answers, whether EDNS0 is usable, TTFB, and an error if
 // both attempts fail.
-func probeUDPWithFallback(ctx context.Context, resolverIP, name string, qtype uint16, timeout time.Duration, dialer *net.Dialer, port int, waitThroughNXDOMAIN bool) (DnsHeader, []string, bool, time.Duration, bool, error) {
+func probeUDPWithFallback(ctx context.Context, resolverIP, name string, qtype uint16, timeout time.Duration, dialer *net.Dialer, port int, waitThroughNXDOMAIN, allowFallback bool) (DnsHeader, []string, bool, time.Duration, bool, error) {
 	addr := net.JoinHostPort(resolverIP, fmt.Sprintf("%d", port))
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: timeout}
@@ -294,7 +303,11 @@ func probeUDPWithFallback(ctx context.Context, resolverIP, name string, qtype ui
 		injected bool
 		lastErr  error
 	)
-	for i, useEDNS := range []bool{true, false} {
+	attempts := []bool{true, false}
+	if !allowFallback {
+		attempts = attempts[:1]
+	}
+	for i, useEDNS := range attempts {
 		query, txid := buildDnsQuery(name, qtype, useEDNS)
 		conn.SetDeadline(time.Now().Add(timeout))
 		if _, werr := conn.Write(query); werr != nil {
@@ -377,7 +390,7 @@ func doDoHQuery(ctx context.Context, resolverIP, name, qtype string, timeout tim
 	if client == nil {
 		client = newDoHClient(timeout, nil)
 	}
-	url := fmt.Sprintf("https://%s:%d/dns-query?name=%s&type=%s", resolverIP, port, name, qtype)
+	url := fmt.Sprintf("https://%s/dns-query?name=%s&type=%s", net.JoinHostPort(resolverIP, strconv.Itoa(port)), name, qtype)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return dohJSONResponse{}, 0, fmt.Errorf("REQ: %s", truncErr(err))

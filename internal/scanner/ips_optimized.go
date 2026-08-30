@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -110,7 +109,7 @@ func (s *Scanner) runThreeWavePipelineOptimized(ctx context.Context, endpoints [
 						atomic.AddInt32(&skippedCount, 1)
 						current := int(atomic.AddInt32(&processed, 1))
 						if progressCb != nil {
-							progressCb(current, total, int(atomic.LoadInt32(&acceptedCount)), fmt.Sprintf("%s:%d", job.ip, job.port), totalIPsInit)
+							progressCb(current, total, int(atomic.LoadInt32(&acceptedCount)), hostPort(job.ip, job.port), totalIPsInit)
 						}
 						continue
 					}
@@ -150,7 +149,7 @@ func (s *Scanner) runThreeWavePipelineOptimized(ctx context.Context, endpoints [
 							passedDomainsStr = ""
 						}
 						s.logf("[ACCEPT] %s:%d status=%s domains=%d/%d domain_score=%d passed=[%s]\n", job.ip, job.port, result.Status, result.DomainsTested, result.DomainTotal, result.DomainScore, passedDomainsStr)
-						resultLine := fmt.Sprintf("%s:%d", job.ip, job.port)
+						resultLine := hostPort(job.ip, job.port)
 						if passedDomainsStr != "" {
 							// Append passed domains after a TAB so the IP:port stays
 							// the first whitespace token (TUI + config-maker parse it).
@@ -182,7 +181,7 @@ func (s *Scanner) runThreeWavePipelineOptimized(ctx context.Context, endpoints [
 
 					if progressCb != nil && shouldReport {
 						progressCb(current, total, int(atomic.LoadInt32(&acceptedCount)),
-							fmt.Sprintf("%s:%d", job.ip, job.port), totalIPsInit)
+							hostPort(job.ip, job.port), totalIPsInit)
 						lastProgressAt.Store(now)
 					}
 				}

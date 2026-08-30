@@ -11,24 +11,59 @@ import cores.ui_layout as ui_layout
 import utils.asn_engine as asn_engine
 
 
-def _load_asn_db():
-    v4_path = paths.root_path("IranASNs", "filtered_ipv4.csv")
-    if not os.path.exists(v4_path):
-        ui_layout.print_err("ASN database not found at IranASNs/filtered_ipv4.csv")
-        return {}
+ASN_FAMILY_FILES = {
+    "ipv4": ("filtered_ipv4.csv",),
+    "ipv6": ("filtered_ipv6.csv",),
+    "both": ("filtered_ipv4.csv", "filtered_ipv6.csv"),
+}
 
+
+def _choose_ip_family():
+    print(ui_layout.color_text(" ASN IP FAMILY", "mode_white"))
+    print(" [1] IPv4 (filtered_ipv4.csv)")
+    print(" [2] IPv6 (filtered_ipv6.csv)")
+    print(" [3] Both IPv4 + IPv6")
+    while True:
+        choice = input("\nSelect IP family [1]: ").strip().lower()
+        if choice in ("", "1", "ipv4", "v4"):
+            return "ipv4"
+        if choice in ("2", "ipv6", "v6"):
+            return "ipv6"
+        if choice in ("3", "both", "all"):
+            return "both"
+        ui_layout.print_err("Choose 1 (IPv4), 2 (IPv6), or 3 (Both).")
+
+
+def _load_asn_db(family="both"):
+    family = family if family in ASN_FAMILY_FILES else "both"
     asn_db = {}
-    with open(v4_path, 'r', encoding='utf-8') as file:
-        reader = csv.reader(file)
-        next(reader, None)
-        for row in reader:
-            if len(row) < 9:
-                continue
-            subnet, asn, name = row[0], row[5], row[6]
-            key = f"{asn} - {name}"
-            if key not in asn_db:
-                asn_db[key] = []
-            asn_db[key].append(subnet)
+    seen = {}
+    loaded_files = 0
+    for filename in ASN_FAMILY_FILES[family]:
+        csv_path = paths.root_path("IranASNs", filename)
+        if not os.path.exists(csv_path):
+            ui_layout.print_err(f"ASN database not found at IranASNs/{filename}")
+            continue
+        loaded_files += 1
+        with open(csv_path, 'r', encoding='utf-8', newline='') as file:
+            reader = csv.reader(file)
+            next(reader, None)
+            for row in reader:
+                if len(row) < 9:
+                    continue
+                subnet, asn, name = row[0].strip(), row[5].strip(), row[6].strip()
+                if not subnet or not asn:
+                    continue
+                key = f"{asn} - {name}"
+                if key not in asn_db:
+                    asn_db[key] = []
+                    seen[key] = set()
+                if subnet not in seen[key]:
+                    seen[key].add(subnet)
+                    asn_db[key].append(subnet)
+
+    if loaded_files == 0:
+        return {}
 
     return asn_db
 
@@ -98,8 +133,9 @@ def _toggle_selection_tokens(tokens, results, selected_keys):
                     selected_keys.add(key)
 
 
-def menu_search_asn(show_queue_message=True):
-    asn_db = _load_asn_db()
+def menu_search_asn(show_queue_message=True, family=None):
+    family = family or _choose_ip_family()
+    asn_db = _load_asn_db(family)
     if not asn_db:
         time.sleep(1.5)
         return []
@@ -123,6 +159,7 @@ def menu_search_asn(show_queue_message=True):
         print(line)
         print(ui_layout.color_text(" INTERACTIVE ASN BROWSER", "mode_white"))
         print(line)
+        print(f" IP Family    : {family.upper()}")
         print(f" Search Query : {query}")
         print(f" Total Matches: {len(results)} ASNs")
         print(f" Selected ASNs: {len(selected_keys)}")
@@ -240,7 +277,8 @@ def menu_export_asn_ips():
 
 
 def menu_browse_asn_db():
-    asn_db = _load_asn_db()
+    family = _choose_ip_family()
+    asn_db = _load_asn_db(family)
     if not asn_db:
         time.sleep(1.5)
         return
@@ -263,6 +301,7 @@ def menu_browse_asn_db():
         print(line)
         print(ui_layout.color_text(" ASN DATABASE BROWSER", "mode_white"))
         print(line)
+        print(f" IP Family    : {family.upper()}")
         print(f" Search Query : {query}")
         print(f" Total Matches: {len(results)} ASNs")
         print(line + "\n")

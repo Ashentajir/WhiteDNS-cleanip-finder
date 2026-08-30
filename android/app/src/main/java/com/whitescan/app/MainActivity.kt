@@ -428,6 +428,7 @@ private fun FormState.toEngineConfig(constrainedDevice: Boolean = false): ScanCo
     cfg.setLiteMode(effectiveLiteMode)
     cfg.setDNSProtocol(dnsProtocol)
     cfg.setDNSReference(dnsReference)
+    cfg.setDNSScanDepth(dnsScanDepth)
     cfg.setDNSTestNearby(dnsTestNearby && !effectiveLiteMode)
     cfg.setE2EDomain(e2eDomain.trim())
     cfg.setE2EPubKey(e2ePubKey.trim())

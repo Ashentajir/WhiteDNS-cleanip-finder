@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math/big"
 	"math/rand"
 	"net"
 	"net/http"
@@ -777,7 +778,7 @@ func (s *Scanner) runThreeWavePipeline(ctx context.Context, endpoints []simpleEn
 				atomic.AddInt32(&skippedCount, 1)
 				current := int(atomic.AddInt32(&processed, 1))
 				if progressCb != nil {
-					progressCb(current, total, int(atomic.LoadInt32(&acceptedCount)), fmt.Sprintf("%s:%d", ip, port), totalIPs)
+					progressCb(current, total, int(atomic.LoadInt32(&acceptedCount)), hostPort(ip, port), totalIPs)
 				}
 				return
 			}
@@ -821,7 +822,7 @@ func (s *Scanner) runThreeWavePipeline(ctx context.Context, endpoints []simpleEn
 					passedDomainsStr = ""
 				}
 				s.logf("[ACCEPT] %s:%d status=%s domains=%d/%d domain_score=%d passed=[%s]\n", ip, port, result.Status, result.DomainsTested, result.DomainTotal, result.DomainScore, passedDomainsStr)
-				resultLine := fmt.Sprintf("%s:%d", ip, port)
+				resultLine := hostPort(ip, port)
 				if passedDomainsStr != "" {
 					// Append passed domains after a TAB so the IP:port stays the
 					// first whitespace token (TUI + config-maker parse it).
@@ -853,7 +854,7 @@ func (s *Scanner) runThreeWavePipeline(ctx context.Context, endpoints []simpleEn
 				now-lastProg >= 250000000 // 250ms
 
 			if progressCb != nil && shouldReport {
-				progressCb(current, total, int(atomic.LoadInt32(&acceptedCount)), fmt.Sprintf("%s:%d", ip, port), totalIPs)
+				progressCb(current, total, int(atomic.LoadInt32(&acceptedCount)), hostPort(ip, port), totalIPs)
 				lastProgressAt.Store(now)
 			}
 
@@ -903,6 +904,13 @@ func (s *Scanner) runThreeWavePipeline(ctx context.Context, endpoints []simpleEn
 	return accepted
 }
 
+// maxIPv6PerCIDR caps how many addresses a single IPv6 prefix contributes.
+// IPv6 allocations are enormous and sparsely populated, so a sequential sweep
+// is worthless: sampleIPv6CIDR spends this budget on the low
+// addresses of a /64 (and narrower), and spreads it across the /64 subnets of
+// a broader aggregate, probing the host IDs resolvers actually use.
+const maxIPv6PerCIDR = 256
+
 // expandCIDR expands a CIDR block to individual IPs
 func expandCIDR(cidr string, maxIPs int) ([]string, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
@@ -914,6 +922,16 @@ func expandCIDR(cidr string, maxIPs int) ([]string, error) {
 		return nil, err
 	}
 
+	if ipnet.IP.To4() == nil && maxIPs > maxIPv6PerCIDR {
+		maxIPs = maxIPv6PerCIDR
+	}
+	if ipnet.IP.To4() == nil {
+		ones, bits := ipnet.Mask.Size()
+		if bits == 128 && bits-ones > 8 {
+			return sampleIPv6CIDR(ipnet, maxIPs), nil
+		}
+	}
+
 	var ips []string
 	for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incrementIP(ip) {
 		if len(ips) >= maxIPs {
@@ -923,6 +941,70 @@ func expandCIDR(cidr string, maxIPs int) ([]string, error) {
 	}
 
 	return ips, nil
+}
+
+func sampleIPv6CIDR(network *net.IPNet, limit int) []string {
+	if network == nil || limit <= 0 || network.IP.To4() != nil {
+		return nil
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 128 || ones < 0 {
+		return nil
+	}
+	start := new(big.Int).SetBytes(network.IP.Mask(network.Mask).To16())
+	if ones >= 64 {
+		out := make([]string, 0, limit)
+		cur := new(big.Int).Set(start)
+		for i := 0; i < limit; i++ {
+			ip := bigIntIPv6(cur)
+			if ip == nil || !network.Contains(ip) {
+				break
+			}
+			out = append(out, ip.String())
+			cur.Add(cur, big.NewInt(1))
+		}
+		return out
+	}
+
+	variableSubnetBits := uint(64 - ones)
+	maxSubnetIndex := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), variableSubnetBits), big.NewInt(1))
+	subnetCount := limit
+	if maxSubnetIndex.IsUint64() && maxSubnetIndex.Uint64()+1 < uint64(subnetCount) {
+		subnetCount = int(maxSubnetIndex.Uint64() + 1)
+	}
+	commonHostIDs := []uint64{1, 0x53, 0, 2, 3, 0x35, 0x1111, 0x8888}
+	out := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		subnetSlot := i % subnetCount
+		hostRound := i / subnetCount
+		subnetIndex := new(big.Int)
+		if subnetCount > 1 {
+			subnetIndex.Mul(maxSubnetIndex, big.NewInt(int64(subnetSlot)))
+			subnetIndex.Div(subnetIndex, big.NewInt(int64(subnetCount-1)))
+		}
+		candidate := new(big.Int).Lsh(subnetIndex, 64)
+		candidate.Add(candidate, start)
+		hostID := commonHostIDs[hostRound%len(commonHostIDs)]
+		if hostRound >= len(commonHostIDs) {
+			hostID = uint64(hostRound - len(commonHostIDs) + 4)
+		}
+		candidate.Add(candidate, new(big.Int).SetUint64(hostID))
+		ip := bigIntIPv6(candidate)
+		if ip != nil && network.Contains(ip) {
+			out = append(out, ip.String())
+		}
+	}
+	return out
+}
+
+func bigIntIPv6(value *big.Int) net.IP {
+	if value == nil || value.Sign() < 0 || value.BitLen() > 128 {
+		return nil
+	}
+	raw := value.Bytes()
+	full := make(net.IP, net.IPv6len)
+	copy(full[len(full)-len(raw):], raw)
+	return full
 }
 
 // incrementIP increments an IP address by 1
@@ -978,7 +1060,7 @@ func (s *Scanner) probeIP(ctx context.Context, ip string, port int, opts IPScanO
 	if connectTimeout <= 0 {
 		connectTimeout = ScanTimeout
 	}
-	preConn, preErr := probePreReachabilityDial(ctx, fmt.Sprintf("%s:%d", ip, port), connectTimeout)
+	preConn, preErr := probePreReachabilityDial(ctx, hostPort(ip, port), connectTimeout)
 	if preErr != nil {
 		result.Status = "dead"
 		result.Error = preErr.Error()
@@ -1037,7 +1119,7 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 
 			attemptTimeout := probeTimeoutForDomain(domain, opts.Timeout, attempt, opts.EndpointCount)
 			reqCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-			url := fmt.Sprintf("http://%s:%d%s", ip, port, probePathForDomain(domain, attempt))
+			url := fmt.Sprintf("http://%s%s", hostPort(ip, port), probePathForDomain(domain, attempt))
 			req, _ := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 			req.Header.Set("Host", domain)
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
@@ -1250,7 +1332,7 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 
 			attemptTimeout := probeTimeoutForDomain(domain, opts.Timeout, attempt, opts.EndpointCount)
 			dialer := &net.Dialer{Timeout: attemptTimeout}
-			conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ip, port))
+			conn, err := dialer.DialContext(ctx, "tcp", hostPort(ip, port))
 			if err != nil {
 				if ctx.Err() != nil {
 					s.logf("[PROBE-TIMEOUT] %s:%d domain=%s hard-deadline reached at attempt %d\n", ip, port, domain, attempt)
@@ -1896,4 +1978,10 @@ func (s *Scanner) GetAllStats() map[string]StatEntry {
 // ClearCache clears any cached scanning data
 func (s *Scanner) ClearCache() error {
 	return nil
+}
+
+// hostPort joins an IP and port into a dial address. IPv6 literals must be
+// bracketed ("[2001:db8::1]:443"), which plain "%s:%d" formatting gets wrong.
+func hostPort(ip string, port int) string {
+	return net.JoinHostPort(ip, strconv.Itoa(port))
 }

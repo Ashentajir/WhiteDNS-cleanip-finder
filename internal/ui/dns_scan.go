@@ -3,7 +3,9 @@ package ui
 import (
 	"context"
 	"fmt"
+	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +22,20 @@ const screenDNSPorts = "dns_ports"
 // screenDNSWorkers lets the user pick the resolver worker-pool size (scan
 // concurrency) after the transport is chosen and before the scan launches.
 const screenDNSWorkers = "dns_workers"
+
+// screenDNSDepth lets users trade the extra NXDOMAIN hijack validation for a
+// faster scan while retaining the core tunnel-readiness checks.
+const screenDNSDepth = "dns_depth"
+
+type dnsDepthPreset struct {
+	label string
+	depth string
+}
+
+var dnsDepthPresets = []dnsDepthPreset{
+	{"Fast - 1.2s probes, one UDP attempt, skips hijack validation", dnsscan.ScanDepthFast},
+	{"Thorough - compatibility retries + NXDOMAIN hijack validation", dnsscan.ScanDepthFull},
+}
 
 // dnsWorkerPreset couples a menu label with a concurrency (worker count).
 type dnsWorkerPreset struct {
@@ -39,7 +55,7 @@ var dnsWorkerPresets = []dnsWorkerPreset{
 // defaultDNSWorkers is used when the user has not visited the worker screen.
 const defaultDNSWorkers = 64
 
-// screenDNSNearby asks whether to expand the /24 around each tunnel-ready
+// screenDNSNearby asks whether to expand the /24 (IPv4) or /120 (IPv6) around each tunnel-ready
 // resolver and rescan it ("Test Nearby IPs"). This can multiply the scan size
 // by 256 per hit, so it is opt-in rather than automatic.
 const screenDNSNearby = "dns_nearby"
@@ -52,7 +68,7 @@ type dnsNearbyPreset struct {
 
 var dnsNearbyPresets = []dnsNearbyPreset{
 	{"No - scan only the resolvers I listed (default)", false},
-	{"Yes - also expand the /24 around each tunnel-ready hit", true},
+	{"Yes - also expand the /24 (IPv4) or /120 (IPv6) around each hit", true},
 }
 
 // dnsPortPreset couples a menu label with the engine protocol + port set.
@@ -155,10 +171,45 @@ func (m tuiModel) handleDNSReferenceScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 		p := dnsReferencePresets[m.cursor]
 		m.dnsReference = p.provider
 		m.addLog(fmt.Sprintf("DNS scan reference resolver: %s", p.label))
+		m.pushScreen(screenDNSDepth)
+		m.cursor = 1 // preserve full validation by default
+	}
+	return m, nil
+}
+
+func (m tuiModel) handleDNSDepthScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < len(dnsDepthPresets)-1 {
+			m.cursor++
+		}
+	case "esc":
+		m.goBack()
+	case "enter":
+		p := dnsDepthPresets[m.cursor]
+		m.dnsScanDepth = p.depth
+		m.addLog(fmt.Sprintf("DNS scan depth: %s", p.label))
 		m.pushScreen(screenDNSWorkers)
 		m.cursor = 2 // default to the 64-worker preset
 	}
 	return m, nil
+}
+
+func (m tuiModel) viewDNSDepth(w, h int) string {
+	items := make([]string, len(dnsDepthPresets))
+	for i, p := range dnsDepthPresets {
+		items[i] = p.label
+	}
+	return m.viewList(w, h, "DNS SCAN DEPTH", items,
+		"↑↓ navigate  ·  Enter next  ·  Esc back")
 }
 
 // viewDNSReference renders the reference-resolver picker using the list style.
@@ -229,7 +280,7 @@ func (m tuiModel) handleDNSNearbyScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 		p := dnsNearbyPresets[m.cursor]
 		m.dnsTestNearby = p.enable
 		if p.enable {
-			m.addLog("DNS scan: Test Nearby IPs enabled (expands /24 around tunnel-ready hits)")
+			m.addLog("DNS scan: Test Nearby IPs enabled (IPv4 /24 or IPv6 /120 around tunnel-ready hits)")
 		} else {
 			m.addLog("DNS scan: Test Nearby IPs disabled")
 		}
@@ -261,13 +312,18 @@ func (m tuiModel) launchDNSScan(targets []string) (tuiModel, tea.Cmd) {
 	m.startOperation() // pushes screenScanning + fresh scanCtx/counters
 	m.scanMsgCh = make(chan tea.Msg, 65536)
 	m.startScanLogFile("dnsscan", targets, nil, workers, 3*time.Second)
-	m.addLog(fmt.Sprintf("Starting DNS resolver/tunnel scan: targets=%d workers=%d", len(targets), workers))
+	depth := m.dnsScanDepth
+	if depth == "" {
+		depth = dnsscan.ScanDepthFull
+	}
+	m.warnIfNoIPv6(targets)
+	m.addLog(fmt.Sprintf("Starting DNS resolver/tunnel scan: targets=%d workers=%d depth=%s", len(targets), workers, depth))
 	return m, m.cmdDNSScan(targets)
 }
 
 // cmdDNSScan runs the resolver scan on a background goroutine: it streams
 // per-resolver progress + full header dumps to the activity log, optionally
-// expands the /24 around tunnel-ready hits ("Test Nearby IPs"), dumps txt/csv/
+// expands the /24 or /120 around tunnel-ready hits ("Test Nearby IPs"), dumps txt/csv/
 // json reports into the "dns scan" output folder, and returns the tunnel-ready
 // shortlist (best score first) as the final result set.
 func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
@@ -297,6 +353,10 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 	if reference == "" {
 		reference = dnsscan.ReferenceGoogle
 	}
+	scanDepth := m.dnsScanDepth
+	if scanDepth == "" {
+		scanDepth = dnsscan.ScanDepthFull
+	}
 
 	return tea.Batch(
 		func() tea.Msg {
@@ -304,14 +364,6 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 			if runCtx == nil {
 				runCtx = context.Background()
 			}
-
-			ips := tlsprobe.ExpandTargets(targets)
-			if len(ips) == 0 {
-				ips = targets
-			}
-			total := len(ips)
-			start := time.Now()
-
 			trySend := func(msg tea.Msg) {
 				select {
 				case ch <- msg:
@@ -319,7 +371,22 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				}
 			}
 
-			trySend(logMsg{text: fmt.Sprintf("[DNS] scanning %d resolver(s): headers + score + tunnel suitability", total)})
+			ips := tlsprobe.ExpandTargets(targets)
+			if len(ips) == 0 {
+				trySend(logMsg{text: "[DNS] no valid resolver IPs could be expanded from the selected targets"})
+				close(ch)
+				return poolOperationCompleteMsg{operationType: "dns_scan", results: []string{"No valid resolver IPs were selected"}, duration: time.Since(t0)}
+			}
+			total := len(ips)
+			start := time.Now()
+
+			v4Count, v6Count := countIPFamilies(ips)
+			modeLabel := "thorough"
+			if scanDepth == dnsscan.ScanDepthFast {
+				modeLabel = "fast"
+			}
+			trySend(logMsg{text: fmt.Sprintf("[DNS] scanning %d resolver(s) (IPv4=%d IPv6=%d), mode=%s transport=%s ports=%v workers=%d",
+				total, v4Count, v6Count, modeLabel, protocol, ports, workers)})
 			trySend(scanProgressMsg{current: 0, total: total, startTime: start, totalIPs: total})
 
 			opts := dnsscan.Options{
@@ -330,6 +397,7 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				Ports:         ports,
 				TestNearby:    testNearby,
 				TruthProvider: reference,
+				ScanDepth:     scanDepth,
 			}
 
 			var mu sync.Mutex
@@ -337,13 +405,17 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 			progress := func(done, tot int, r dnsscan.ResolverResult) {
 				status := "no-response"
 				if r.Responded {
-					status = fmt.Sprintf("resp %dms", r.BestLatency.Milliseconds())
+					status = fmt.Sprintf("reply %dms", r.BestLatency.Milliseconds())
 				}
-				trySend(logMsg{text: fmt.Sprintf("%-21s %-13s score=%d/6 RA=%v EDNS=%v POISON=%v TXT=%v HIJACK=%v(%s) PATH=%s/%s TUNNEL=%v (%s)",
-					r.IP, status, r.Score, r.RA, r.EDNS, r.Poisoned, r.TxtPass,
-					r.Transparent, r.HijackConfidence, r.PreferredTransport, r.FallbackTransport,
-					r.TunnelReady, r.TunnelReason)})
-				if r.HijackReason != "" {
+				trySend(logMsg{text: fmt.Sprintf("%-39s %-13s verdict=%-7s score=%d/6 path=%s/%s tunnel=%v via=%s (%s)",
+					r.IP, status, r.Status, r.Score, r.PreferredTransport, r.FallbackTransport,
+					r.TunnelReady, r.TunnelTransport, r.TunnelReason)})
+				trySend(logMsg{text: fmt.Sprintf("    detect RA=%v AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d EDNS=%v TXT=%v poison=%v hijack=%v(%s)",
+					r.RA, r.AA, r.TC, r.RD, r.RCodes, r.QDCount, r.ANCount, r.NSCount, r.ARCount,
+					r.EDNS, r.TxtPass, r.Poisoned, r.Transparent, r.HijackConfidence)})
+				if r.HijackConfidence == "skipped" {
+					trySend(logMsg{text: "    hijack validation skipped (fast scan)"})
+				} else if r.HijackReason != "" {
 					trySend(logMsg{text: fmt.Sprintf("    hijack evidence=%s paths=udp:%v,tcp:%v checks=%d anomalies=%d rcodes=%s",
 						r.HijackReason, r.HijackUDP, r.HijackTCP, r.HijackChecks, r.HijackAnomalies, r.HijackRCodes)})
 				}
@@ -351,7 +423,7 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 					trySend(logMsg{text: "    " + hd})
 				}
 				mu.Lock()
-				if r.TunnelReady {
+				if r.Passed() {
 					hits++
 				}
 				h := hits
@@ -361,7 +433,7 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 
 			all := dnsscan.ScanResolvers(runCtx, ips, opts, progress)
 
-			// Test Nearby IPs: expand the /24 around each tunnel-ready resolver
+			// Test Nearby IPs: expand the /24 or /120 around each tunnel-ready resolver
 			// and rescan the addresses we haven't already tried.
 			if opts.TestNearby && runCtx.Err() == nil {
 				scanned := make(map[string]struct{}, len(ips))
@@ -370,7 +442,7 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				}
 				var nearby []string
 				for _, r := range all {
-					if !r.TunnelReady {
+					if !r.Passed() {
 						continue
 					}
 					for _, nip := range dnsscan.NearbyIPs(r.IP) {
@@ -382,7 +454,8 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 					}
 				}
 				if len(nearby) > 0 {
-					trySend(logMsg{text: fmt.Sprintf("[DNS] Test Nearby IPs: expanding %d address(es) around tunnel-ready hits", len(nearby))})
+					nearbyV4, nearbyV6 := countIPFamilies(nearby)
+					trySend(logMsg{text: fmt.Sprintf("[DNS] Test Nearby IPs: expanding %d address(es) (IPv4=%d IPv6=%d) around tunnel-ready hits", len(nearby), nearbyV4, nearbyV6)})
 					base := len(ips)
 					nprogress := func(done, tot int, r dnsscan.ResolverResult) {
 						progress(base+done, base+tot, r)
@@ -401,33 +474,72 @@ func (m tuiModel) cmdDNSScan(targets []string) tea.Cmd {
 				trySend(logMsg{text: "[DNS] report write failed: " + err.Error()})
 			} else {
 				trySend(logMsg{text: "[DNS] reports written to " + paths.Dir})
-				trySend(logMsg{text: "    " + filepath.Base(paths.Full) + " / " + filepath.Base(paths.Passed) + " / " + filepath.Base(paths.CSV) + " / " + filepath.Base(paths.XLSX) + " / " + filepath.Base(paths.HTML) + " / " + filepath.Base(paths.JSON)})
+				trySend(logMsg{text: "    valid DNS servers  -> " + filepath.Base(paths.Valid)})
+				trySend(logMsg{text: "    tunnel-ready IPs   -> " + filepath.Base(paths.TunnelReadyIPs) + " (detail: " + filepath.Base(paths.TunnelReady) + ")"})
+				trySend(logMsg{text: "    full/detail        -> " + filepath.Base(paths.Full) + " / " + filepath.Base(paths.Passed) + " / " + filepath.Base(paths.CSV) + " / " + filepath.Base(paths.XLSX) + " / " + filepath.Base(paths.HTML) + " / " + filepath.Base(paths.JSON)})
 			}
 
-			// Build the on-screen shortlist (tunnel-ready, best score first).
-			var tunnelReady []string
-			for _, r := range all {
-				if !r.TunnelReady {
+			// Build the on-screen result list: the tunnel-ready shortlist first,
+			// then every working (unpoisoned, unhijacked) resolver — a valid DNS
+			// server is useful even when it can't carry a tunnel.
+			sorted := dnsscan.SortResults(all)
+			valid := dnsscan.ValidResolvers(sorted)
+			var tunnelReady, results []string
+			for _, r := range sorted {
+				if !r.Passed() {
 					continue
 				}
 				tag := ""
 				if r.Nearby {
 					tag = " [nearby]"
 				}
-				tunnelReady = append(tunnelReady, fmt.Sprintf("%-21s score=%d/6 poison=%v transparent=%v%s",
-					r.IP, r.Score, r.Poisoned, r.Transparent, tag))
+				tunnelReady = append(tunnelReady, fmt.Sprintf("%-39s score=%d/6 via=%s poison=%v transparent=%v%s",
+					r.IP, r.Score, r.TunnelTransport, r.Poisoned, r.Transparent, tag))
 			}
-			trySend(logMsg{text: fmt.Sprintf("[DNS] done: %d tunnel-ready of %d scanned", len(tunnelReady), len(all))})
+			results = append(results, fmt.Sprintf("== TUNNEL-READY (%d) ==", len(tunnelReady)))
+			if len(tunnelReady) == 0 {
+				results = append(results, "  (none)")
+			}
+			results = append(results, tunnelReady...)
+			results = append(results, fmt.Sprintf("== VALID DNS SERVERS (%d) ==", len(valid)))
+			if len(valid) == 0 {
+				results = append(results, "  (none)")
+			}
+			for _, r := range valid {
+				tag := ""
+				if r.Nearby {
+					tag = " [nearby]"
+				}
+				results = append(results, fmt.Sprintf("%-39s score=%d/6 %dms path=%s/%s RA=%v EDNS=%v TXT=%v tunnel=%v%s",
+					r.IP, r.Score, r.BestLatency.Milliseconds(), r.PreferredTransport, r.FallbackTransport,
+					r.RA, r.EDNS, r.TxtPass, r.TunnelReady, tag))
+			}
+			trySend(logMsg{text: fmt.Sprintf("[DNS] done: %d tunnel-ready, %d valid DNS server(s) of %d scanned", len(tunnelReady), len(valid), len(all))})
 			close(ch)
 
 			if err := runCtx.Err(); err != nil {
-				return poolOperationCompleteMsg{operationType: "dns_scan", results: tunnelReady, err: err, duration: time.Since(t0)}
+				return poolOperationCompleteMsg{operationType: "dns_scan", results: results, err: err, duration: time.Since(t0)}
 			}
-			if len(tunnelReady) == 0 {
-				tunnelReady = []string{"No tunnel-ready resolvers found (see 'dns scan' folder + activity log)"}
+			if len(tunnelReady) == 0 && len(valid) == 0 {
+				results = []string{"No valid or tunnel-ready resolvers found (see 'dns scan' folder + activity log)"}
 			}
-			return poolOperationCompleteMsg{operationType: "dns_scan", results: tunnelReady, duration: time.Since(t0)}
+			return poolOperationCompleteMsg{operationType: "dns_scan", results: results, duration: time.Since(t0)}
 		},
 		waitForScanMessage(ch),
 	)
+}
+
+func countIPFamilies(ips []string) (v4, v6 int) {
+	for _, value := range ips {
+		ip := net.ParseIP(strings.TrimSpace(value))
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			v4++
+		} else {
+			v6++
+		}
+	}
+	return v4, v6
 }

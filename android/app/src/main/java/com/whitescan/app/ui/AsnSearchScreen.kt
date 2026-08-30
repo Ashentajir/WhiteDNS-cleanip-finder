@@ -32,6 +32,7 @@ private const val CONSTRAINED_ASN_SEARCH_LIMIT = 80
 private const val CONSTRAINED_ASN_MIN_QUERY_CHARS = 2
 private const val ASN_SEARCH_DEBOUNCE_MS = 300L
 private const val ASN_PAGE_QUERY_PREFIX = "__WHITEDNS_ASN_PAGE__\t"
+private const val ASN_FAMILY_QUERY_PREFIX = "__WHITEDNS_ASN_FAMILY__\t"
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -39,11 +40,12 @@ fun AsnSearchScreen(
     dataDir: String,
     confirmLabel: String = "Use selection",
     constrainedDevice: Boolean = false,
-    // Returns the expanded IPv4 CIDRs for the chosen ASNs (ready to scan/export).
+    // Returns the expanded CIDRs for the chosen ASNs and selected IP family.
     onSelected: (cidrs: String) -> Unit,
     onCancel: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
+    var family by remember { mutableStateOf("ipv4") }
     var rows by remember { mutableStateOf<List<AsnRow>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
     var loadingMore by remember { mutableStateOf(false) }
@@ -63,7 +65,7 @@ fun AsnSearchScreen(
         focusRequester.requestFocus()
     }
 
-    LaunchedEffect(trimmedQuery, constrainedDevice) {
+    LaunchedEffect(trimmedQuery, constrainedDevice, family) {
         if (constrainedDevice &&
             trimmedQuery.isNotEmpty() &&
             trimmedQuery != "*" &&
@@ -76,14 +78,14 @@ fun AsnSearchScreen(
 
         loading = true
         delay(ASN_SEARCH_DEBOUNCE_MS)
-        val loaded = loadAsnRows(dataDir, trimmedQuery, constrainedDevice, 0)
+        val loaded = loadAsnRows(dataDir, trimmedQuery, constrainedDevice, 0, family)
         rows = loaded
         nextOffset = if (constrainedDevice) loaded.size else 0
         hasMoreRows = constrainedDevice && loaded.size == CONSTRAINED_ASN_SEARCH_LIMIT
         loading = false
     }
 
-    LaunchedEffect(trimmedQuery, constrainedDevice) {
+    LaunchedEffect(trimmedQuery, constrainedDevice, family) {
         if (!constrainedDevice) return@LaunchedEffect
         snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
             .collect { lastVisible ->
@@ -96,7 +98,7 @@ fun AsnSearchScreen(
                 if (!shouldLoad) return@collect
 
                 loadingMore = true
-                val loaded = loadAsnRows(dataDir, trimmedQuery, constrainedDevice, nextOffset)
+                val loaded = loadAsnRows(dataDir, trimmedQuery, constrainedDevice, nextOffset, family)
                 if (loaded.isEmpty()) {
                     hasMoreRows = false
                 } else {
@@ -110,6 +112,30 @@ fun AsnSearchScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
+        Text(
+            "IP family",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(start = 16.dp, top = 8.dp),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            listOf("ipv4" to "IPv4", "ipv6" to "IPv6", "both" to "Both").forEach { (value, label) ->
+                FilterChip(
+                    selected = family == value,
+                    onClick = {
+                        if (family != value) {
+                            family = value
+                            selected.clear()
+                            expandError = null
+                        }
+                    },
+                    label = { Text(label) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
 
         // Search bar — auto-focused so keyboard pops up on entry
         OutlinedTextField(
@@ -150,7 +176,8 @@ fun AsnSearchScreen(
                             onClick = {
                                 if (expanding) return@Button
                                 expandError = null
-                                val ids = selected.values.joinToString("\n") { it.asn }
+                                val ids = ASN_FAMILY_QUERY_PREFIX + family + "\t" +
+                                    selected.values.joinToString("\n") { it.asn }
                                 scope.launch {
                                     expanding = true
                                     val result = withContext(Dispatchers.IO) {
@@ -162,7 +189,7 @@ fun AsnSearchScreen(
                                     if (error != null) {
                                         expandError = error.message ?: "expand failed"
                                     } else if (cidrs.isBlank()) {
-                                        expandError = "No IPv4 ranges found for the selected ASN(s)"
+                                        expandError = "No ${family.uppercase()} ranges found for the selected ASN(s)"
                                     } else {
                                         onSelected(cidrs)
                                     }
@@ -296,6 +323,7 @@ private suspend fun loadAsnRows(
     query: String,
     constrainedDevice: Boolean,
     offset: Int,
+    family: String,
 ): List<AsnRow> = withContext(Dispatchers.IO) {
     runCatching {
         val search = query.ifBlank { "*" }
@@ -304,7 +332,7 @@ private suspend fun loadAsnRows(
                 "$ASN_PAGE_QUERY_PREFIX$offset\t$CONSTRAINED_ASN_SEARCH_LIMIT\t$search"
             else
                 search
-        Mobile.asnSearch(dataDir, engineQuery)
+        Mobile.asnSearch(dataDir, ASN_FAMILY_QUERY_PREFIX + family + "\t" + engineQuery)
             .trimEnd()
             .lines()
             .filter { it.isNotBlank() }

@@ -7,7 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
 )
 
 func TestMaxSpeedRankIPsRaised(t *testing.T) {
@@ -289,6 +288,25 @@ func TestFileBackedTargetsStageSameIPs(t *testing.T) {
 	}
 }
 
+func TestExpandTargetsToFileSamplesBroadIPv6Prefix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ipv6-targets.txt")
+	count, err := expandTargetsToFile([]string{"2001:db8::/48"}, path, liteDedupCap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 256 {
+		t.Fatalf("staged %d IPv6 samples, want 256", count)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Fields(string(content))
+	if lines[0] != "2001:db8::1" || lines[len(lines)-1] != "2001:db8:0:ffff::1" {
+		t.Fatalf("IPv6 staging did not span prefix: first=%q last=%q", lines[0], lines[len(lines)-1])
+	}
+}
+
 func TestASNSelectionFileBackedTargetsStageSameIPs(t *testing.T) {
 	dir := t.TempDir()
 	rows, err := ASNSearch(dir, "*")
@@ -328,5 +346,30 @@ func TestASNSelectionFileBackedTargetsStageSameIPs(t *testing.T) {
 	}
 	if inlineCount != fileCount {
 		t.Fatalf("inline ASN staged %d IPs, file-backed ASN staged %d", inlineCount, fileCount)
+	}
+}
+
+func TestASNFamilyControlSupportsIPv6PickerAndExpansion(t *testing.T) {
+	family, query := parseASNFamilyQuery(asnFamilyQueryPrefix + "ipv6\t*")
+	if family != "ipv6" || query != "*" {
+		t.Fatalf("family query parsed as family=%q query=%q", family, query)
+	}
+	rows, err := asnSearchRowsFamily(t.TempDir(), query, 1, 0, family)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := strings.TrimSpace(strings.Split(rows, "\n")[0])
+	parts := strings.Split(first, "\t")
+	if len(parts) < 3 {
+		t.Fatalf("bad IPv6 ASN row %q", first)
+	}
+	cidrs, err := ExpandASNs(t.TempDir(), asnFamilyQueryPrefix+"ipv6\t"+parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cidr := range strings.Fields(cidrs) {
+		if !strings.Contains(cidr, ":") {
+			t.Fatalf("IPv6 expansion returned non-IPv6 target %q", cidr)
+		}
 	}
 }

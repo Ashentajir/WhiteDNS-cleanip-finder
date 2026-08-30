@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -553,7 +554,7 @@ func parseMasscanOutputStreaming(filepath string, targetPorts []int) ([]string, 
 
 			// Validate IP format
 			if isValidIP(ip) {
-				endpoints = append(endpoints, fmt.Sprintf("%s:%d", ip, port))
+				endpoints = append(endpoints, net.JoinHostPort(ip, strconv.Itoa(port)))
 				parsed++
 			}
 		}
@@ -618,7 +619,7 @@ func parseNmapOutputStreaming(filepath string, targetPorts []int) ([]string, int
 		for _, match := range matches {
 			if len(match) > 1 {
 				if port, err := strconv.Atoi(match[1]); err == nil && portMap[port] {
-					endpoints = append(endpoints, fmt.Sprintf("%s:%d", ip, port))
+					endpoints = append(endpoints, net.JoinHostPort(ip, strconv.Itoa(port)))
 					parsed++
 				}
 			}
@@ -696,19 +697,7 @@ func maxInt(a, b int) int {
 }
 
 func isValidIP(ip string) bool {
-	// Quick validation - check for valid IPv4 format
-	parts := strings.Split(ip, ".")
-	if len(parts) != 4 {
-		return false
-	}
-
-	for _, part := range parts {
-		num, err := strconv.Atoi(part)
-		if err != nil || num < 0 || num > 255 {
-			return false
-		}
-	}
-	return true
+	return net.ParseIP(strings.TrimSpace(ip)) != nil
 }
 
 // Atomic counter for concurrent progress tracking

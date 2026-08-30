@@ -45,23 +45,22 @@ func detectHijack(ctx context.Context, ip string, timeout time.Duration, dialer 
 	}
 	observations := make(chan hijackObservation, count)
 	var wg sync.WaitGroup
-	if testUDP {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for _, qname := range names {
-				observations <- probeNegativeUDP(ctx, ip, qname, timeout, dialer, port)
-			}
-		}()
-	}
-	if testTCP {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for _, qname := range names {
-				observations <- probeNegativeTCP(ctx, ip, qname, timeout, dialer, port)
-			}
-		}()
+	for _, qname := range names {
+		name := qname
+		if testUDP {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				observations <- probeNegativeUDP(ctx, ip, name, timeout, dialer, port)
+			}()
+		}
+		if testTCP {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				observations <- probeNegativeTCP(ctx, ip, name, timeout, dialer, port)
+			}()
+		}
 	}
 	wg.Wait()
 	close(observations)

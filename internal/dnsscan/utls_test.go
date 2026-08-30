@@ -90,3 +90,32 @@ func TestDoHQueryUsesUTLSHTTP1Transport(t *testing.T) {
 		t.Fatalf("unexpected DoH response: %+v", resp)
 	}
 }
+
+func TestDialUTLSBoundsSilentHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn // intentionally never answer the ClientHello
+		}
+	}()
+
+	start := time.Now()
+	conn, err := dialUTLS(context.Background(), "tcp", listener.Addr().String(), &net.Dialer{Timeout: 120 * time.Millisecond}, nil)
+	if conn != nil {
+		conn.Close()
+	}
+	serverConn := <-accepted
+	serverConn.Close()
+	if err == nil {
+		t.Fatal("silent TLS peer unexpectedly completed a handshake")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("silent TLS handshake ignored dial timeout: %s", elapsed)
+	}
+}

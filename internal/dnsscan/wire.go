@@ -38,7 +38,8 @@ type DnsHeader struct {
 	ARCount uint16 // Additional records
 }
 
-// String renders the header as a compact single-line dump for reports.
+// String renders the complete header for low-level diagnostics. User-facing
+// scan reports use ResolverResult.HeaderDump's reduced detection fields.
 func (h DnsHeader) String() string {
 	b := func(v bool) int {
 		if v {

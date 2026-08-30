@@ -102,7 +102,7 @@ func renderMenuTitle(width int, logs int) string {
 	meta := sDim.Render(fmt.Sprintf("logs:%d  %s", logs, time.Now().Format("15:04:05")))
 
 	if width < 72 {
-		line := renderGradientText("WHITEDNS v1.3.6", brandColors, true)
+		line := renderGradientText("WHITEDNS v1.4.0", brandColors, true)
 		credit := renderGradientText("developed by TAjirax", devColors, false)
 		return lipgloss.PlaceHorizontal(width, lipgloss.Center, line) + "\n" +
 			lipgloss.PlaceHorizontal(width, lipgloss.Center, credit) + "\n" +
@@ -131,7 +131,7 @@ func renderMenuTitle(width int, logs int) string {
 		out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, renderGradientText(line, brandColors, true)))
 		out.WriteString("\n")
 	}
-	tagline := renderGradientText("v1.3.6  -  developed by TAjirax", devColors, true)
+	tagline := renderGradientText("v1.4.0  -  developed by TAjirax", devColors, true)
 	out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, tagline))
 	out.WriteString("\n")
 	out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, meta))
@@ -181,6 +181,7 @@ type logMsg struct{ text string }
 const (
 	screenMenu              = "menu"
 	screenScanMode          = "scan_mode"
+	screenASNFamily         = "asn_family"
 	screenSelectASN         = "select_asn"
 	screenTypeTargets       = "type_targets"
 	screenReviewTargets     = "review_targets"
@@ -357,6 +358,11 @@ type tuiModel struct {
 
 	asnList     []asnEntry
 	asnFiltered []asnEntry
+	// asnFamily selects which bundled ASN dataset the selector lists:
+	// asnFamilyV4, asnFamilyV6, or asnFamilyBoth.
+	asnFamily string
+	// asnPlaceholder carries the search-box prompt across the family picker.
+	asnPlaceholder string
 
 	portPresets        []portPreset
 	methodOptions      []string
@@ -415,6 +421,9 @@ type tuiModel struct {
 	// dnsConcurrency is the resolver worker-pool size chosen on the DNS worker
 	// screen (0 => defaultDNSWorkers).
 	dnsConcurrency int
+	// dnsScanDepth is "fast" (core tunnel checks) or "full" (also performs
+	// NXDOMAIN hijack validation). Empty preserves the full engine default.
+	dnsScanDepth string
 	// dnsTestNearby toggles /24 nearby-IP expansion around tunnel-ready hits,
 	// chosen on the DNS "Test Nearby IPs" screen (default off).
 	dnsTestNearby bool
@@ -517,7 +526,8 @@ func NewTUI(a *App) *tuiModel {
 	m.transferLogMu = &sync.Mutex{}
 	m.scanOutputMu = &sync.Mutex{}
 
-	m.loadASNFile()
+	m.asnFamily = asnFamilyV4
+	m.loadASNFile(m.asnFamily)
 	return m
 }
 
@@ -525,16 +535,71 @@ func NewTUI(a *App) *tuiModel {
 //  ASN loader
 // ------------------------------------------------------------
 
-func (m *tuiModel) loadASNFile() {
+// ASN dataset families offered before the ASN selector opens. The bundled
+// IranASNs data ships as two CSVs (filtered_ipv4.csv / filtered_ipv6.csv) and
+// the scan paths handle both, so the user picks which one to select from.
+const (
+	asnFamilyV4   = "ipv4"
+	asnFamilyV6   = "ipv6"
+	asnFamilyBoth = "both"
+)
+
+type asnFamilyPreset struct {
+	label  string
+	family string
+}
+
+var asnFamilyPresets = []asnFamilyPreset{
+	{"IPv4 - filtered_ipv4.csv", asnFamilyV4},
+	{"IPv6 - filtered_ipv6.csv", asnFamilyV6},
+	{"Both - IPv4 + IPv6 networks per ASN", asnFamilyBoth},
+}
+
+// loadASNFile fills the ASN selector from the bundled dataset(s) for family
+// ("ipv4", "ipv6", or "both"), falling back to on-disk IranASNs CSVs.
+func (m *tuiModel) loadASNFile(family string) {
+	// Group networks by ASN across every requested dataset.
+	asnMap := make(map[string]*asnEntry)
+	seenNetworks := make(map[string]map[string]struct{})
+	m.asnList = nil
+	m.asnFiltered = nil
+
+	files := []string{"filtered_ipv4.csv"}
+	switch family {
+	case asnFamilyV6:
+		files = []string{"filtered_ipv6.csv"}
+	case asnFamilyBoth:
+		files = []string{"filtered_ipv4.csv", "filtered_ipv6.csv"}
+	}
+	for _, name := range files {
+		m.loadASNCSVInto(asnMap, seenNetworks, name)
+	}
+
+	// Convert to sorted list
+	for _, entry := range asnMap {
+		sort.Strings(entry.Networks) // Sort networks within each ASN
+		m.asnList = append(m.asnList, *entry)
+	}
+	sort.Slice(m.asnList, func(i, j int) bool { return m.asnList[i].ASN < m.asnList[j].ASN })
+	m.asnFiltered = m.asnList
+}
+
+func (m *tuiModel) loadASNCSVInto(asnMap map[string]*asnEntry, seenNetworks map[string]map[string]struct{}, csvName string) {
 	var r *bufio.Reader
-	asnData, bundleErr := bundledata.ASNIPv4CSV()
+	var asnData []byte
+	var bundleErr error
+	if csvName == "filtered_ipv6.csv" {
+		asnData, bundleErr = bundledata.ASNIPv6CSV()
+	} else {
+		asnData, bundleErr = bundledata.ASNIPv4CSV()
+	}
 	if bundleErr == nil {
 		r = bufio.NewReader(bytes.NewReader(asnData))
 	} else {
-		asnFile := resolveASNCSVPath(m.app.DataDir)
+		asnFile := resolveASNCSVPath(m.app.DataDir, csvName)
 		f, err := os.Open(asnFile)
 		if err != nil {
-			m.addLog(fmt.Sprintf("Warning: could not load ASN file: %v", err))
+			m.addLog(fmt.Sprintf("Warning: could not load %s: %v", csvName, err))
 			return
 		}
 		defer f.Close()
@@ -551,8 +616,6 @@ func (m *tuiModel) loadASNFile() {
 		return lineReader.Read()
 	}
 
-	// Group networks by ASN
-	asnMap := make(map[string]*asnEntry)
 	lineNo := 0
 	for {
 		line, readErr := r.ReadString('\n')
@@ -581,35 +644,39 @@ func (m *tuiModel) loadASNFile() {
 			}
 			continue
 		}
-		asn := rec[5]
-		network := rec[0]
+		asn := strings.TrimSpace(rec[5])
+		network := strings.TrimSpace(rec[0])
+		if asn == "" || network == "" {
+			if readErr == io.EOF {
+				break
+			}
+			continue
+		}
 
 		if _, exists := asnMap[asn]; !exists {
 			asnMap[asn] = &asnEntry{
 				ASN:      asn,
-				ASName:   rec[6],
-				ASDomain: rec[7],
-				Type:     rec[8],
+				ASName:   strings.TrimSpace(rec[6]),
+				ASDomain: strings.TrimSpace(rec[7]),
+				Type:     strings.TrimSpace(rec[8]),
 				Networks: []string{},
 			}
 		}
-		asnMap[asn].Networks = append(asnMap[asn].Networks, network)
+		if seenNetworks[asn] == nil {
+			seenNetworks[asn] = make(map[string]struct{})
+		}
+		if _, duplicate := seenNetworks[asn][network]; !duplicate {
+			seenNetworks[asn][network] = struct{}{}
+			asnMap[asn].Networks = append(asnMap[asn].Networks, network)
+		}
 
 		if readErr == io.EOF {
 			break
 		}
 	}
-
-	// Convert to sorted list
-	for _, entry := range asnMap {
-		sort.Strings(entry.Networks) // Sort networks within each ASN
-		m.asnList = append(m.asnList, *entry)
-	}
-	sort.Slice(m.asnList, func(i, j int) bool { return m.asnList[i].ASN < m.asnList[j].ASN })
-	m.asnFiltered = m.asnList
 }
 
-func resolveASNCSVPath(dataDir string) string {
+func resolveASNCSVPath(dataDir, csvName string) string {
 	// Build a list of roots to probe. We attempt dataDir, its parent,
 	// the executable directory, the working directory, and then walk
 	// upwards from those roots a few levels to handle installs where
@@ -644,7 +711,7 @@ func resolveASNCSVPath(dataDir string) string {
 	for _, root := range roots {
 		cur := filepath.Clean(root)
 		for i := 0; i < 5; i++ {
-			candidate := filepath.Join(cur, "IranASNs", "filtered_ipv4.csv")
+			candidate := filepath.Join(cur, "IranASNs", csvName)
 			if _, ok := probed[candidate]; !ok {
 				probed[candidate] = struct{}{}
 				if _, err := os.Stat(candidate); err == nil {
@@ -662,10 +729,10 @@ func resolveASNCSVPath(dataDir string) string {
 	// Last-resort: try the file next to dataDir even if it doesn't exist; this
 	// keeps previous behavior for callers expecting a path.
 	if dataDir != "" {
-		return filepath.Join(filepath.Dir(dataDir), "IranASNs", "filtered_ipv4.csv")
+		return filepath.Join(filepath.Dir(dataDir), "IranASNs", csvName)
 	}
 	// Fallback to known relative path in repository root
-	return filepath.Join("..", "IranASNs", "filtered_ipv4.csv")
+	return filepath.Join("..", "IranASNs", csvName)
 }
 
 // ------------------------------------------------------------
@@ -785,6 +852,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m, screenCmd = m.handleSNISourceScreen(msg)
 	case screenSNIMode:
 		m, screenCmd = m.handleSNIModeScreen(msg)
+	case screenASNFamily:
+		m, screenCmd = m.handleASNFamilyScreen(msg)
 	case screenSelectASN:
 		m, screenCmd = m.handleSelectASNScreen(msg)
 	case screenTypeTargets:
@@ -817,6 +886,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m, screenCmd = m.handleDNSPortsScreen(msg)
 	case screenDNSReference:
 		m, screenCmd = m.handleDNSReferenceScreen(msg)
+	case screenDNSDepth:
+		m, screenCmd = m.handleDNSDepthScreen(msg)
 	case screenDNSWorkers:
 		m, screenCmd = m.handleDNSWorkersScreen(msg)
 	case screenDNSNearby:
@@ -862,6 +933,8 @@ func (m tuiModel) View() string {
 		body = m.viewSNISource(w, h)
 	case screenSNIMode:
 		body = m.viewSNIMode(w, h)
+	case screenASNFamily:
+		body = m.viewASNFamily(w, h)
 	case screenSelectASN:
 		body = m.viewSelectASN(w, h)
 	case screenTypeTargets:
@@ -896,6 +969,8 @@ func (m tuiModel) View() string {
 		body = m.viewDNSPorts(w, h)
 	case screenDNSReference:
 		body = m.viewDNSReference(w, h)
+	case screenDNSDepth:
+		body = m.viewDNSDepth(w, h)
 	case screenDNSWorkers:
 		body = m.viewDNSWorkers(w, h)
 	case screenDNSNearby:
@@ -1127,7 +1202,7 @@ func (m tuiModel) viewSelectASN(w, h int) string {
 	for i := start; i < end; i++ {
 		e := m.asnFiltered[i]
 		checked := " "
-		if m.selectedItems[i] {
+		if index, ok := m.asnListIndex(e.ASN); ok && m.selectedItems[index] {
 			checked = "x"
 		}
 		line := fmt.Sprintf("[%s] %-12s  %s", checked, e.ASN, e.ASName)
@@ -1606,7 +1681,7 @@ func (m tuiModel) viewScanResults(w, h int) string {
 		"sni_scanner":    "SNI Scanner Results (TLS Hostname Probe)",
 		"desync_scanner": "Desync Pair Miner Results",
 		"speed_rank":     "Speed & Loss Rank Results (best first)",
-		"dns_scan":       "DNS Tunnel-Ready Resolvers",
+		"dns_scan":       "DNS Results (tunnel-ready + valid servers)",
 	}[m.operationType]
 	if opLabel == "" {
 		opLabel = "Scan Results"
@@ -1980,20 +2055,17 @@ func (m tuiModel) activateMenuItem() (tuiModel, tea.Cmd) {
 	case "scan_socks5":
 		m.gotoScanMode("scan", "socks5")
 	case "reload_pool":
-		m.pushScreen(screenSelectASN)
 		m.operationType = "reload_pool"
-		m.resetASNScreen("Search ASN for pool reload")
+		m.gotoSelectASN("Search ASN for pool reload")
 	case "manage_pool":
 		return m, m.cmdManagePool()
 	case "inspect_ip":
-		m.pushScreen(screenSelectASN)
 		m.operationType = "inspect_pool"
-		m.resetASNScreen("Search ASN to inspect")
+		m.gotoSelectASN("Search ASN to inspect")
 	case "export_asn":
-		m.pushScreen(screenSelectASN)
 		m.operationType = "export_asn"
 		m.scanConfig.ASNs = nil
-		m.resetASNScreen("Search ASN to export")
+		m.gotoSelectASN("Search ASN to export")
 	case "edit_dpi_target":
 		m.pushScreen(screenEditDPITarget)
 		m.tiStep = 1
@@ -2058,9 +2130,8 @@ func (m tuiModel) handleScanModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 	case "enter":
 		switch m.cursor {
 		case 0:
-			m.pushScreen(screenSelectASN)
 			m.scanConfig.Mode = "asn"
-			m.resetASNScreen("Search ASN")
+			m.gotoSelectASN("Search ASN")
 		case 1:
 			m.scanConfig.Mode = "paste"
 			m.pushScreen(screenTypeTargets)
@@ -2246,12 +2317,12 @@ func (m tuiModel) handleSelectASNScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 		}
 	case "tab":
 		if m.cursor < len(m.asnFiltered) {
-			m.selectedItems[m.cursor] = !m.selectedItems[m.cursor]
+			m.toggleASNSelection(m.cursor)
 		}
 	case " ":
 		if !m.typingEnabled {
 			if m.cursor < len(m.asnFiltered) {
-				m.selectedItems[m.cursor] = !m.selectedItems[m.cursor]
+				m.toggleASNSelection(m.cursor)
 			}
 		}
 	case "enter":
@@ -2263,10 +2334,11 @@ func (m tuiModel) handleSelectASNScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 			m.setToast(sError.Render("x Select at least one ASN"), 3*time.Second)
 			return m, nil
 		}
-		for idx := range m.selectedItems {
-			if idx < len(m.asnFiltered) {
+		m.scanConfig.ASNs = nil
+		for idx, selected := range m.selectedItems {
+			if selected && idx < len(m.asnList) {
 				// Add all networks for this ASN
-				m.scanConfig.ASNs = append(m.scanConfig.ASNs, m.asnFiltered[idx].Networks...)
+				m.scanConfig.ASNs = append(m.scanConfig.ASNs, m.asnList[idx].Networks...)
 			}
 		}
 		if m.operationType == "sni_scanner" || m.operationType == "desync_scanner" {
@@ -2302,6 +2374,29 @@ func (m tuiModel) handleSelectASNScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 		m.cursor = 0
 	}
 	return m, nil
+}
+
+// asnListIndex resolves a filtered row back to the stable full-list index used
+// by selectedItems. Without this, changing the search text after selecting an
+// ASN silently applied the selection to a different row.
+func (m *tuiModel) asnListIndex(asn string) (int, bool) {
+	index := sort.Search(len(m.asnList), func(i int) bool { return m.asnList[i].ASN >= asn })
+	return index, index < len(m.asnList) && m.asnList[index].ASN == asn
+}
+
+func (m *tuiModel) toggleASNSelection(filteredIndex int) {
+	if filteredIndex < 0 || filteredIndex >= len(m.asnFiltered) {
+		return
+	}
+	index, ok := m.asnListIndex(m.asnFiltered[filteredIndex].ASN)
+	if !ok {
+		return
+	}
+	if m.selectedItems[index] {
+		delete(m.selectedItems, index)
+		return
+	}
+	m.selectedItems[index] = true
 }
 
 func (m *tuiModel) selectAllASNs() {
@@ -2648,6 +2743,7 @@ func (m tuiModel) handleSelectConcurrencyScreen(msg tea.Msg) (tuiModel, tea.Cmd)
 			m.startScanLogFile("ipscan", targets, ports, m.scanConfig.Concurrency, timeout)
 			m.app.Scanner.SetTargetPorts(ports)
 			m.scanMsgCh = make(chan tea.Msg, 65536)
+			m.warnIfNoIPv6(targets)
 			m.addLog(fmt.Sprintf("Starting IP scan: targets=%d ports=%d concurrency=%d method=%s", len(targets), len(ports), m.scanConfig.Concurrency, strings.ToUpper(strings.TrimSpace(m.scanConfig.Method))))
 			m.addLog(fmt.Sprintf("Scan log file: %s", m.scanLogPath))
 			return m, m.cmdPoolOperation("scan_ips", targets)
@@ -3336,7 +3432,7 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 						} else {
 							// record passed ip:port to incremental passed file
 							if m.scanOutputPath != "" {
-								_ = storage.AppendLine(m.scanOutputPath, fmt.Sprintf("%s:%d", pr.IP, pr.Port))
+								_ = storage.AppendLine(m.scanOutputPath, net.JoinHostPort(pr.IP, strconv.Itoa(pr.Port)))
 							}
 						}
 						// forward progress update
@@ -3597,6 +3693,61 @@ func (m *tuiModel) setupInput(placeholder string) {
 	m.lastEnterTime = time.Time{} // reset Enter time tracking
 	m.pasteBuffer = ""
 	m.ti.Focus()
+}
+
+// gotoSelectASN opens the IPv4/IPv6 dataset picker that precedes the ASN
+// selector. The chosen family decides which bundled CSV the list is built from.
+func (m *tuiModel) gotoSelectASN(placeholder string) {
+	m.asnPlaceholder = placeholder
+	m.pushScreen(screenASNFamily)
+	m.cursor = 0
+	for i, p := range asnFamilyPresets {
+		if p.family == m.asnFamily {
+			m.cursor = i
+		}
+	}
+}
+
+func (m tuiModel) handleASNFamilyScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < len(asnFamilyPresets)-1 {
+			m.cursor++
+		}
+	case "esc":
+		m.goBack()
+	case "enter":
+		p := asnFamilyPresets[m.cursor]
+		if p.family != m.asnFamily || len(m.asnList) == 0 {
+			m.asnFamily = p.family
+			m.loadASNFile(p.family)
+		}
+		m.addLog(fmt.Sprintf("ASN dataset: %s (%d ASNs)", p.label, len(m.asnList)))
+		if len(m.asnList) == 0 {
+			m.setToast(sError.Render("x No ASNs in that dataset"), 4*time.Second)
+			return m, nil
+		}
+		m.pushScreen(screenSelectASN)
+		m.resetASNScreen(m.asnPlaceholder)
+	}
+	return m, nil
+}
+
+func (m tuiModel) viewASNFamily(w, h int) string {
+	items := make([]string, len(asnFamilyPresets))
+	for i, p := range asnFamilyPresets {
+		items[i] = p.label
+	}
+	return m.viewList(w, h, "ASN DATASET (IP FAMILY)", items,
+		"↑↓ navigate  ·  Enter select  ·  Esc back")
 }
 
 func (m *tuiModel) resetASNScreen(placeholder string) {

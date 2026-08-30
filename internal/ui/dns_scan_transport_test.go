@@ -25,3 +25,15 @@ func TestDNSPortPresetProtocolsAreAcceptedByEngine(t *testing.T) {
 		}
 	}
 }
+
+func TestDNSDepthPresetsExposeFastAndFullModes(t *testing.T) {
+	found := map[string]bool{}
+	for _, preset := range dnsDepthPresets {
+		found[preset.depth] = true
+	}
+	for _, depth := range []string{"fast", "full"} {
+		if !found[depth] {
+			t.Errorf("desktop DNS picker is missing %q scan depth", depth)
+		}
+	}
+}
