@@ -3432,7 +3432,7 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 						} else {
 							// record passed ip:port to incremental passed file
 							if m.scanOutputPath != "" {
-								_ = storage.AppendLine(m.scanOutputPath, fmt.Sprintf("%s:%d", pr.IP, pr.Port))
+								_ = storage.AppendLine(m.scanOutputPath, net.JoinHostPort(pr.IP, strconv.Itoa(pr.Port)))
 							}
 						}
 						// forward progress update

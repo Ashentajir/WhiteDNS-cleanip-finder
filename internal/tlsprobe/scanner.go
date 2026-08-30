@@ -401,11 +401,11 @@ func normalizePorts(cfg ScanConfig) []int {
 // are capped so large ASN networks are still scanned.
 const maxIPsPerCIDR = 65536
 
-// maxIPv6PerCIDR caps IPv6 prefixes far lower than IPv4 ones. A /64 holds 2^64
-// addresses of which only the low ones are ever assigned in practice, so
-// sweeping 65536 of them finds nothing and costs hours.
-// ponytail: low-address heuristic; add a per-prefix stride/host-list if real
-// deployments turn up outside ::0-::ff.
+// maxIPv6PerCIDR caps how many addresses a single IPv6 prefix contributes.
+// IPv6 allocations are enormous and sparsely populated, so a sequential sweep
+// is worthless: sampleIPv6Prefix spends this budget on the low
+// addresses of a /64 (and narrower), and spreads it across the /64 subnets of
+// a broader aggregate, probing the host IDs resolvers actually use.
 const maxIPv6PerCIDR = 256
 
 // ExpandTargets is the exported form of expandTargets so callers can compute an

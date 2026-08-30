@@ -904,11 +904,11 @@ func (s *Scanner) runThreeWavePipeline(ctx context.Context, endpoints []simpleEn
 	return accepted
 }
 
-// maxIPv6PerCIDR caps IPv6 prefixes far lower than IPv4 ones. A /64 holds 2^64
-// addresses of which only the low ones are ever assigned in practice, so
-// sweeping tens of thousands of them finds nothing and costs hours.
-// ponytail: low-address heuristic; add a stride/host-list if real deployments
-// turn up outside ::0-::ff.
+// maxIPv6PerCIDR caps how many addresses a single IPv6 prefix contributes.
+// IPv6 allocations are enormous and sparsely populated, so a sequential sweep
+// is worthless: sampleIPv6CIDR spends this budget on the low
+// addresses of a /64 (and narrower), and spreads it across the /64 subnets of
+// a broader aggregate, probing the host IDs resolvers actually use.
 const maxIPv6PerCIDR = 256
 
 // expandCIDR expands a CIDR block to individual IPs
