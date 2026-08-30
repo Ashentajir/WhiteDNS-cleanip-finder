@@ -10,6 +10,38 @@ from utils import paths
 ASN_DATA_V4 = {i: [] for i in range(256)} 
 ASN_DATA_V6 = []
 ASN_LOADED = False
+MAX_IPV4_EXPANSION = 65536
+MAX_IPV6_SAMPLES = 256
+
+
+def _expand_network(net):
+    """Expand small networks and sample broad IPv6 ASN aggregates safely."""
+    if net.version == 4:
+        if net.num_addresses > MAX_IPV4_EXPANSION:
+            return [str(ip) for _, ip in zip(range(MAX_IPV4_EXPANSION), net.hosts())]
+        return [str(ip) for ip in net]
+
+    if net.num_addresses <= MAX_IPV6_SAMPLES:
+        return [str(ip) for ip in net]
+    if net.prefixlen >= 64:
+        start = int(net.network_address)
+        return [str(ipaddress.IPv6Address(start + offset)) for offset in range(MAX_IPV6_SAMPLES)]
+
+    variable_subnet_bits = 64 - net.prefixlen
+    subnet_count = min(MAX_IPV6_SAMPLES, 1 << variable_subnet_bits)
+    max_subnet_index = (1 << variable_subnet_bits) - 1
+    common_host_ids = (1, 0x53, 0, 2, 3, 0x35, 0x1111, 0x8888)
+    start = int(net.network_address)
+    samples = []
+    for index in range(MAX_IPV6_SAMPLES):
+        subnet_slot = index % subnet_count
+        host_round = index // subnet_count
+        subnet_index = 0 if subnet_count == 1 else (max_subnet_index * subnet_slot) // (subnet_count - 1)
+        host_id = common_host_ids[host_round] if host_round < len(common_host_ids) else host_round - len(common_host_ids) + 4
+        candidate = ipaddress.IPv6Address(start + (subnet_index << 64) + host_id)
+        if candidate in net:
+            samples.append(str(candidate))
+    return samples
 
 def load_asn_data():
     """Loads ASN datasets into memory for fast IP lookups."""
@@ -122,16 +154,12 @@ def expand_target(target, silent=False):
             print(f"[*] Warning: Regex matched ASNs contain {total_ips} IPs. Expansion may take a moment...")
         
         for net in subnets:
-            if net.version == 6 and net.num_addresses > 65536:
+            if net.version == 6 and net.num_addresses > MAX_IPV6_SAMPLES and not silent:
+                print(f"[*] Sampling {MAX_IPV6_SAMPLES} representative IPv6 addresses from {net}.")
+            elif net.num_addresses > MAX_IPV4_EXPANSION and not silent:
                 if not silent:
-                    print(f"[-] Skipping IPv6 subnet {net} to prevent memory overflow.")
-                continue
-            if net.num_addresses > 65536:
-                if not silent:
-                    print(f"[*] Warning: Subnet {net} is massive. Truncating to 65536 IPs.")
-                asn_ips.extend([str(ip) for _, ip in zip(range(65536), net.hosts())])
-                continue
-            asn_ips.extend([str(ip) for ip in net])
+                    print(f"[*] Warning: Subnet {net} is massive. Truncating to {MAX_IPV4_EXPANSION} IPs.")
+            asn_ips.extend(_expand_network(net))
         
         return asn_ips
     
@@ -161,31 +189,24 @@ def expand_target(target, silent=False):
             print(f"[*] Warning: {upper_target} contains {total_ips} IPs. Expansion may take a moment...")
             
         for net in subnets:
-            if net.version == 6 and net.num_addresses > 65536:
+            if net.version == 6 and net.num_addresses > MAX_IPV6_SAMPLES and not silent:
+                print(f"[*] Sampling {MAX_IPV6_SAMPLES} representative IPv6 addresses from {net}.")
+            elif net.num_addresses > MAX_IPV4_EXPANSION:
                 if not silent: 
-                    print(f"[-] Skipping IPv6 subnet {net} to prevent memory overflow.")
-                continue
-            if net.num_addresses > 65536:
-                if not silent: 
-                    print(f"[*] Warning: Subnet {net} is massive. Truncating to 65536 IPs.")
-                # Fast generator evaluation trick to truncate without a memory crash
-                asn_ips.extend([str(ip) for _, ip in zip(range(65536), net.hosts())])
-                continue
-            asn_ips.extend([str(ip) for ip in net])
+                    print(f"[*] Warning: Subnet {net} is massive. Truncating to {MAX_IPV4_EXPANSION} IPs.")
+            asn_ips.extend(_expand_network(net))
             
         return asn_ips
         
     # Standard IP or CIDR expansion
     try:
         net = ipaddress.ip_network(target, strict=False)
-        if net.version == 6 and net.num_addresses > 65536:
+        if net.version == 6 and net.num_addresses > MAX_IPV6_SAMPLES:
+            if not silent:
+                print(f"[*] Sampling {MAX_IPV6_SAMPLES} representative IPv6 addresses from {target}.")
+        elif net.num_addresses > MAX_IPV4_EXPANSION:
             if not silent: 
-                print(f"[-] Skipping IPv6 subnet {target} to prevent memory overflow.")
-            return []
-        if net.num_addresses > 65536:
-            if not silent: 
-                print(f"[*] Warning: Subnet {target} is massive. Truncating to 65536 IPs.")
-            return [str(ip) for _, ip in zip(range(65536), net.hosts())]
-        return [str(ip) for ip in net]
+                print(f"[*] Warning: Subnet {target} is massive. Truncating to {MAX_IPV4_EXPANSION} IPs.")
+        return _expand_network(net)
     except ValueError: 
         return [target] # Treat as a raw domain or invalid string if parsing fails

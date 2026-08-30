@@ -86,8 +86,8 @@ private val DNS_TRANSPORT_PRESETS = listOf(
 
 private data class DnsDepthPreset(val label: String, val value: String)
 private val DNS_DEPTH_PRESETS = listOf(
-    DnsDepthPreset("Fast - transport-aware A/RA/TXT checks", "fast"),
-    DnsDepthPreset("Full - also detect NXDOMAIN hijacking", "full"),
+    DnsDepthPreset("Fast - 1.2s probes, one UDP attempt", "fast"),
+    DnsDepthPreset("Thorough - retries + NXDOMAIN hijack checks", "full"),
 )
 
 // DNS reference resolver presets — the trusted resolver used to build the
@@ -234,9 +234,9 @@ fun ScanConfigForm(
                 }
                 Text(
                     if (form.dnsScanDepth == "fast")
-                        "Skips the extra NXDOMAIN hijack probes; tunnel-readiness and poisoning checks remain enabled"
+                        "Uses a short probe deadline and skips UDP compatibility retries and NXDOMAIN hijack probes"
                     else
-                        "Runs every check, including repeated NXDOMAIN hijack validation",
+                        "Runs compatibility retries and repeated NXDOMAIN hijack validation",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

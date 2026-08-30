@@ -34,6 +34,14 @@ type Options struct {
 const (
 	ScanDepthFast = "fast"
 	ScanDepthFull = "full"
+	// ScanDepthThorough is accepted as a user-facing alias for the canonical
+	// "full" value. Keeping Full as the stored value preserves mobile/API
+	// compatibility while the UI can call the mode Thorough.
+	ScanDepthThorough = "thorough"
+
+	// Fast scans are intended for broad ASN sweeps. One slow/dead resolver must
+	// not occupy a worker for the normal three-second probe timeout.
+	fastProbeTimeout = 1200 * time.Millisecond
 )
 
 func (o Options) withDefaults() Options {
@@ -64,8 +72,13 @@ func (o Options) withDefaults() Options {
 	switch strings.ToLower(strings.TrimSpace(o.ScanDepth)) {
 	case ScanDepthFast:
 		o.ScanDepth = ScanDepthFast
+	case ScanDepthFull, ScanDepthThorough:
+		o.ScanDepth = ScanDepthFull
 	default:
 		o.ScanDepth = ScanDepthFull
+	}
+	if o.ScanDepth == ScanDepthFast && o.Timeout > fastProbeTimeout {
+		o.Timeout = fastProbeTimeout
 	}
 	return o
 }
@@ -135,16 +148,30 @@ func classifyStatus(r ResolverResult) string {
 		return StatusInvalid
 	case r.Transparent:
 		return StatusHijack
-	case !hasCleanAPath(r.Probes):
+	case hasCleanAPath(r.Probes):
+		return StatusValid
+	case hasPoisonedAPath(r.Probes):
 		return StatusPoison
 	default:
-		return StatusValid
+		// A parseable REFUSED/SERVFAIL/NODATA response proves the server is
+		// reachable, but it is neither a valid recursive resolver nor evidence
+		// of poisoning. Keep it out of both valid and poison result lists.
+		return StatusInvalid
 	}
 }
 
 func hasCleanAPath(probes []DnsProbeResult) bool {
 	for _, probe := range probes {
-		if probe.HeaderOK && !probe.IsPoisoned {
+		if probe.Responded && probe.HeaderOK && !probe.IsPoisoned {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPoisonedAPath(probes []DnsProbeResult) bool {
+	for _, probe := range probes {
+		if probe.IsPoisoned {
 			return true
 		}
 	}
@@ -260,7 +287,8 @@ func mergeHeaderSummary(result *ResolverResult, probe DnsProbeResult) {
 
 // ScanResolvers probes every resolver IP and reports aggregated results. The
 // truth table is fetched once up front. progress (optional) is called after each
-// resolver completes, from a single goroutine, so it is safe for UI updates.
+// resolver completes. Calls are serialized and receive monotonically increasing
+// done values, so UI callbacks do not need their own ordering guard.
 func ScanResolvers(ctx context.Context, ips []string, opts Options, progress func(done, total int, r ResolverResult)) []ResolverResult {
 	opts = opts.withDefaults()
 
@@ -270,11 +298,15 @@ func ScanResolvers(ctx context.Context, ips []string, opts Options, progress fun
 	dohClient := newDoHClient(opts.Timeout, dialer)
 
 	total := len(ips)
+	if total == 0 {
+		return nil
+	}
 	results := make([]ResolverResult, total)
+	completed := make([]bool, total)
 
 	jobs := make(chan int)
 	var wg sync.WaitGroup
-	var mu sync.Mutex
+	var progressMu sync.Mutex
 	done := 0
 
 	worker := func() {
@@ -285,13 +317,14 @@ func ScanResolvers(ctx context.Context, ips []string, opts Options, progress fun
 			}
 			r := ScanResolver(ctx, strings.TrimSpace(ips[i]), opts, truth, dialer, dohClient)
 			results[i] = r
-			mu.Lock()
+			completed[i] = true
+			progressMu.Lock()
 			done++
 			d := done
-			mu.Unlock()
 			if progress != nil {
 				progress(d, total, r)
 			}
+			progressMu.Unlock()
 		}
 	}
 
@@ -308,13 +341,23 @@ func ScanResolvers(ctx context.Context, ips []string, opts Options, progress fun
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
-			return results
+			return completedResults(results, completed)
 		case jobs <- i:
 		}
 	}
 	close(jobs)
 	wg.Wait()
 	return results
+}
+
+func completedResults(results []ResolverResult, completed []bool) []ResolverResult {
+	out := make([]ResolverResult, 0, len(results))
+	for i, result := range results {
+		if completed[i] {
+			out = append(out, result)
+		}
+	}
+	return out
 }
 
 // ScanResolver probes one resolver across all configured protocols, runs a TXT
@@ -495,7 +538,7 @@ func probeAllProtocols(ctx context.Context, ip string, opts Options, truth *Trut
 		port := p
 		if wantUDP && p != 853 && p != 443 {
 			probes = append(probes, func() DnsProbeResult {
-				return ProbeUDP(ctx, ip, domain, truth, opts.Timeout, dialer, port)
+				return probeUDP(ctx, ip, domain, truth, opts.Timeout, dialer, port, opts.ScanDepth != ScanDepthFast)
 			})
 		}
 		if wantTCP && p != 853 && p != 443 {
@@ -534,7 +577,7 @@ func probeTXTProtocols(ctx context.Context, ip string, opts Options, dialer *net
 		port := p
 		if wantUDP && port != 853 && port != 443 {
 			probes = append(probes, func() DnsProbeResult {
-				return ProbeTXTUDP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, port)
+				return probeTXTUDP(ctx, ip, opts.TxtDomain, opts.Timeout, dialer, port, opts.ScanDepth != ScanDepthFast)
 			})
 		}
 		if wantTCP && port != 853 && port != 443 {
@@ -702,16 +745,27 @@ func randomLabel() string {
 	return hex.EncodeToString(b[:])
 }
 
-// NearbyIPs returns the 256 addresses of the /24 containing ip (range-scout
-// "Test Nearby IPs"). Returns nil for non-IPv4 input.
+// NearbyIPs returns the 256 addresses sharing ip's last-octet block: the /24
+// for IPv4, the /120 for IPv6 (range-scout "Test Nearby IPs"). Returns nil for
+// unparseable input.
 func NearbyIPs(ip string) []string {
-	p := net.ParseIP(strings.TrimSpace(ip)).To4()
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed == nil {
+		return nil
+	}
+	p := parsed.To4()
+	if p == nil {
+		p = parsed.To16()
+	}
 	if p == nil {
 		return nil
 	}
 	out := make([]string, 0, 256)
 	for i := 0; i < 256; i++ {
-		out = append(out, fmt.Sprintf("%d.%d.%d.%d", p[0], p[1], p[2], i))
+		next := make(net.IP, len(p))
+		copy(next, p)
+		next[len(next)-1] = byte(i)
+		out = append(out, next.String())
 	}
 	return out
 }

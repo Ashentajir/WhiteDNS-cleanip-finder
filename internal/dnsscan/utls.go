@@ -30,6 +30,19 @@ func dialUTLS(ctx context.Context, network, addr string, dialer *net.Dialer, alp
 		ServerName:         host,
 		InsecureSkipVerify: true, // raw-IP resolver scan; see function comment
 	}, utls.HelloChrome_Auto)
+	// Dialer.Timeout only limits the TCP connect. Bound the TLS handshake too,
+	// otherwise a peer that accepts TCP and then stays silent can pin a DNS scan
+	// worker indefinitely (especially visible in Fast mode).
+	var handshakeDeadline time.Time
+	if dialer.Timeout > 0 {
+		handshakeDeadline = time.Now().Add(dialer.Timeout)
+	}
+	if ctxDeadline, ok := ctx.Deadline(); ok && (handshakeDeadline.IsZero() || ctxDeadline.Before(handshakeDeadline)) {
+		handshakeDeadline = ctxDeadline
+	}
+	if !handshakeDeadline.IsZero() {
+		_ = uconn.SetDeadline(handshakeDeadline)
+	}
 
 	// Chrome advertises h2 first. DoT must not negotiate an HTTP protocol, and
 	// net/http's custom TLS hook below speaks HTTP/1.1, so tailor only ALPN while
@@ -54,6 +67,7 @@ func dialUTLS(ctx context.Context, network, addr string, dialer *net.Dialer, alp
 		rawConn.Close()
 		return nil, err
 	}
+	_ = uconn.SetDeadline(time.Time{})
 	return uconn, nil
 }
 

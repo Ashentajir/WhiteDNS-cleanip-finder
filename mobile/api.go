@@ -665,6 +665,12 @@ func expandTargetsToFile(targets []string, path string, dedupCap int) (int, erro
 		if perr != nil {
 			continue
 		}
+		if ipnet.IP.To4() == nil {
+			for _, sample := range tlsprobe.ExpandTargets([]string{t}) {
+				emit(sample)
+			}
+			continue
+		}
 		cur := make(net.IP, len(ipnet.IP))
 		copy(cur, ipnet.IP.Mask(ipnet.Mask))
 		emitted := 0
@@ -718,6 +724,14 @@ func expandTargetsLimited(targets []string, limit int) []string {
 		}
 		_, ipnet, err := net.ParseCIDR(t)
 		if err != nil {
+			continue
+		}
+		if ipnet.IP.To4() == nil {
+			for _, sample := range tlsprobe.ExpandTargets([]string{t}) {
+				if emit(sample) {
+					return out
+				}
+			}
 			continue
 		}
 		cur := make(net.IP, len(ipnet.IP))
@@ -1209,7 +1223,7 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 		reference = dnsscan.ReferenceGoogle
 	}
 	scanDepth := strings.ToLower(strings.TrimSpace(cfg.DNSScanDepth))
-	if scanDepth != dnsscan.ScanDepthFast {
+	if scanDepth != dnsscan.ScanDepthFast && scanDepth != dnsscan.ScanDepthThorough {
 		scanDepth = dnsscan.ScanDepthFull
 	}
 	testNearby := cfg.DNSTestNearby && !liteMode
@@ -1309,7 +1323,7 @@ func StartDNSScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 				if r.Responded {
 					status = fmt.Sprintf("resp %dms", r.BestLatency.Milliseconds())
 				}
-				line := fmt.Sprintf("%-15s %-13s verdict=%s score=%d/6 tunnel=%v via=%s (%s)",
+				line := fmt.Sprintf("%-39s %-13s verdict=%s score=%d/6 tunnel=%v via=%s (%s)",
 					r.IP, status, r.Status, r.Score, r.TunnelReady, r.TunnelTransport, r.TunnelReason)
 				line += fmt.Sprintf(" path=%s fallback=%s udp_poison=%v tcp_poison=%v",
 					r.PreferredTransport, r.FallbackTransport, r.UDPPoisoned, r.TCPPoisoned)
@@ -1646,25 +1660,30 @@ func ExportASN(dataDir, query string) (string, error) {
 	return path, err
 }
 
-// ExpandASNs takes newline/space/comma-separated ASN identifiers (e.g. the ones
-// the ASN picker returns) and expands each to its IPv4 CIDRs, returning them as
-// a newline-separated string suitable for use as scan Targets. IPv6 ranges are
-// skipped because the IP/SNI/proxy scanners operate on IPv4.
+// ExpandASNs expands picker ASN identifiers to scan targets. Plain input keeps
+// the legacy IPv4 behavior; the GUI may prepend an ASN-family control prefix.
 func ExpandASNs(dataDir, asnIDs string) (string, error) {
+	family, asnIDs := parseASNFamilyQuery(asnIDs)
 	eng := asn.NewASNEngine(dataDir)
-	if err := eng.LoadIPv4(); err != nil {
-		return "", err
+	var loadErr error
+	if family == "ipv4" {
+		loadErr = eng.LoadIPv4()
+	} else {
+		loadErr = eng.Load()
+	}
+	if loadErr != nil {
+		return "", loadErr
 	}
 	ids := splitTargets(asnIDs)
 	if len(ids) == 0 {
 		return "", fmt.Errorf("no ASNs given")
 	}
-	cidrs, err := eng.IPv4CIDRsForASNs(ids)
+	cidrs, err := eng.CIDRsForASNs(ids, family)
 	if err != nil {
 		return "", err
 	}
 	if len(cidrs) == 0 {
-		return "", fmt.Errorf("no IPv4 CIDRs found for the selected ASN(s)")
+		return "", fmt.Errorf("no %s CIDRs found for the selected ASN(s)", family)
 	}
 	return strings.Join(cidrs, "\n"), nil
 }
@@ -1680,7 +1699,28 @@ func ExportCIDRs(dataDir, cidrs string) (string, error) {
 	return path, err
 }
 
-const asnPageQueryPrefix = "__WHITEDNS_ASN_PAGE__\t"
+const (
+	asnPageQueryPrefix   = "__WHITEDNS_ASN_PAGE__\t"
+	asnFamilyQueryPrefix = "__WHITEDNS_ASN_FAMILY__\t"
+)
+
+func parseASNFamilyQuery(value string) (family, rest string) {
+	if !strings.HasPrefix(value, asnFamilyQueryPrefix) {
+		return "ipv4", value
+	}
+	familyText, rest, ok := strings.Cut(strings.TrimPrefix(value, asnFamilyQueryPrefix), "\t")
+	if !ok {
+		return "ipv4", value
+	}
+	switch strings.ToLower(strings.TrimSpace(familyText)) {
+	case "ipv6", "v6":
+		return "ipv6", rest
+	case "both", "all", "dual":
+		return "both", rest
+	default:
+		return "ipv4", rest
+	}
+}
 
 func parseASNSearchQuery(query string, defaultLimit int) (string, int, int) {
 	if !strings.HasPrefix(query, asnPageQueryPrefix) {
@@ -1714,29 +1754,39 @@ func parseASNSearchQuery(query string, defaultLimit int) (string, int, int) {
 	return actualQuery, offset, limit
 }
 
-// ASNSearch returns matching ASNs as newline-separated "ASN\tName\tipv4Count"
-// rows. ASNs with no IPv4 CIDRs are omitted (the scanner is IPv4-only), and the
-// count reported is the IPv4 subnet count — so the picker never offers an ASN
-// that would fail to expand.
+// ASNSearch returns matching ASNs as newline-separated
+// "ASN\tName\tsubnetCount" rows. An optional family control prefix selects
+// IPv4, IPv6, or both; unprefixed calls retain the legacy IPv4 behavior.
 func ASNSearch(dataDir, query string) (string, error) {
 	limit := 0
 	if forceLiteRuntime() {
 		limit = liteASNSearchLimit
 	}
+	family, query := parseASNFamilyQuery(query)
 	query, offset, limit := parseASNSearchQuery(query, limit)
-	return asnSearchRows(dataDir, query, limit, offset)
+	return asnSearchRowsFamily(dataDir, query, limit, offset, family)
 }
 
 func asnSearchRows(dataDir, query string, limit int, offset int) (string, error) {
+	return asnSearchRowsFamily(dataDir, query, limit, offset, "ipv4")
+}
+
+func asnSearchRowsFamily(dataDir, query string, limit int, offset int, family string) (string, error) {
 	eng := asn.NewASNEngine(dataDir)
-	if err := eng.LoadIPv4(); err != nil {
-		return "", err
+	var loadErr error
+	if family == "ipv4" {
+		loadErr = eng.LoadIPv4()
+	} else {
+		loadErr = eng.Load()
+	}
+	if loadErr != nil {
+		return "", loadErr
 	}
 	searchLimit := limit
 	if offset > 0 && limit > 0 {
 		searchLimit = offset + limit
 	}
-	groups, err := eng.SearchSummaries(query, searchLimit)
+	groups, err := eng.SearchSummariesFamily(query, searchLimit, family)
 	if err != nil {
 		return "", err
 	}

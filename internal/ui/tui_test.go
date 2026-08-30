@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +10,69 @@ import (
 	"testing"
 	"time"
 )
+
+func TestASNFamilyLoaderReadsIPv4IPv6AndBothDatasets(t *testing.T) {
+	m := &tuiModel{app: &App{DataDir: t.TempDir()}}
+
+	assertFamily := func(family string, wantV4, wantV6 bool) (int, int) {
+		t.Helper()
+		m.loadASNFile(family)
+		if len(m.asnList) == 0 {
+			t.Fatalf("%s ASN dataset is empty", family)
+		}
+		v4, v6 := 0, 0
+		for _, entry := range m.asnList {
+			for _, target := range entry.Networks {
+				ip, _, err := net.ParseCIDR(target)
+				if err != nil {
+					ip = net.ParseIP(target)
+				}
+				if ip == nil {
+					t.Fatalf("%s contains invalid IP target %q", family, target)
+				}
+				if ip.To4() != nil {
+					v4++
+				} else {
+					v6++
+				}
+			}
+		}
+		if (v4 > 0) != wantV4 || (v6 > 0) != wantV6 {
+			t.Fatalf("%s loaded v4=%d v6=%d, want v4=%v v6=%v", family, v4, v6, wantV4, wantV6)
+		}
+		return v4, v6
+	}
+
+	v4Only, _ := assertFamily(asnFamilyV4, true, false)
+	_, v6Only := assertFamily(asnFamilyV6, false, true)
+	v4Both, v6Both := assertFamily(asnFamilyBoth, true, true)
+	if v4Both != v4Only || v6Both != v6Only {
+		t.Fatalf("combined dataset lost or duplicated networks: both=%d/%d individual=%d/%d", v4Both, v6Both, v4Only, v6Only)
+	}
+}
+
+func TestASNSelectionRemainsStableWhenSearchFilterChanges(t *testing.T) {
+	m := &tuiModel{
+		asnList: []asnEntry{
+			{ASN: "AS1", Networks: []string{"10.0.0.0/24"}},
+			{ASN: "AS2", Networks: []string{"10.0.1.0/24"}},
+			{ASN: "AS3", Networks: []string{"2001:db8::/48"}},
+		},
+		selectedItems: make(map[int]bool),
+	}
+	m.asnFiltered = []asnEntry{m.asnList[2]}
+	m.toggleASNSelection(0)
+	m.asnFiltered = []asnEntry{m.asnList[0]}
+	m.toggleASNSelection(0)
+	if !m.selectedItems[0] || !m.selectedItems[2] || len(m.selectedItems) != 2 {
+		t.Fatalf("filter changed selected ASN identities: %+v", m.selectedItems)
+	}
+	m.asnFiltered = []asnEntry{m.asnList[2]}
+	m.toggleASNSelection(0)
+	if m.selectedItems[2] || len(m.selectedItems) != 1 {
+		t.Fatalf("deselect should remove the stable selection: %+v", m.selectedItems)
+	}
+}
 
 func TestAppendTransferLogLineFromScanLogCapturesBenchmarkLines(t *testing.T) {
 	tmpDir := t.TempDir()

@@ -256,10 +256,6 @@ func (e *ASNEngine) loadCSVReader(reader io.Reader, isV4 bool) error {
 
 		}
 
-		if readErr == io.EOF {
-			break
-		}
-
 		entry := asnEntry{
 			network:    ipnet,
 			asn:        asn,
@@ -277,6 +273,10 @@ func (e *ASNEngine) loadCSVReader(reader io.Reader, isV4 bool) error {
 			}
 		} else {
 			e.dataV6 = append(e.dataV6, entry)
+		}
+
+		if readErr == io.EOF {
+			break
 		}
 	}
 
@@ -385,11 +385,21 @@ func (e *ASNEngine) SearchByPattern(pattern string) ([]*ASNInfo, error) {
 // in the result. A positive limit returns only the top N groups; explicit
 // searches prioritize match relevance before subnet count.
 func (e *ASNEngine) SearchSummaries(query string, limit int) ([]ASNSummary, error) {
+	return e.SearchSummariesFamily(query, limit, "ipv4")
+}
+
+// SearchSummariesFamily is the family-aware form used by GUI ASN pickers.
+// family may be "ipv4", "ipv6", or "both".
+func (e *ASNEngine) SearchSummariesFamily(query string, limit int, family string) ([]ASNSummary, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if !e.loadedV4 {
+	family = normalizeFamily(family)
+	if family != "ipv6" && !e.loadedV4 {
 		return nil, fmt.Errorf("ASN IPv4 data not loaded")
+	}
+	if family != "ipv4" && !e.loadedV6 {
+		return nil, fmt.Errorf("ASN IPv6 data not loaded")
 	}
 
 	query = strings.TrimSpace(query)
@@ -399,23 +409,33 @@ func (e *ASNEngine) SearchSummaries(query string, limit int) ([]ASNSummary, erro
 	}
 
 	groups := make(map[string]*ASNSummary)
-	for _, entries := range e.dataV4 {
-		for _, entry := range entries {
-			if !matcher(entry.asn, entry.name) {
-				continue
+	addEntry := func(entry asnEntry) {
+		if !matcher(entry.asn, entry.name) {
+			return
+		}
+		summary, ok := groups[entry.asn]
+		if !ok {
+			summary = &ASNSummary{ASN: entry.asn, Name: entry.name, Type: entry.asnType}
+			groups[entry.asn] = summary
+		}
+		if summary.Name == "" && entry.name != "" {
+			summary.Name = entry.name
+		}
+		if summary.Type == "" && entry.asnType != "" {
+			summary.Type = entry.asnType
+		}
+		summary.SubnetCount++
+	}
+	if family != "ipv6" {
+		for _, entries := range e.dataV4 {
+			for _, entry := range entries {
+				addEntry(entry)
 			}
-			summary, ok := groups[entry.asn]
-			if !ok {
-				summary = &ASNSummary{ASN: entry.asn, Name: entry.name, Type: entry.asnType}
-				groups[entry.asn] = summary
-			}
-			if summary.Name == "" && entry.name != "" {
-				summary.Name = entry.name
-			}
-			if summary.Type == "" && entry.asnType != "" {
-				summary.Type = entry.asnType
-			}
-			summary.SubnetCount++
+		}
+	}
+	if family != "ipv4" {
+		for _, entry := range e.dataV6 {
+			addEntry(entry)
 		}
 	}
 
@@ -492,11 +512,20 @@ func NormalizeASN(s string) string {
 // IPv4CIDRsForASNs expands exact ASN identifiers to their IPv4 CIDRs in one
 // pass. This avoids repeated full-database searches from mobile selection flows.
 func (e *ASNEngine) IPv4CIDRsForASNs(asnIDs []string) ([]string, error) {
+	return e.CIDRsForASNs(asnIDs, "ipv4")
+}
+
+// CIDRsForASNs returns exact ASN targets for one or both IP families.
+func (e *ASNEngine) CIDRsForASNs(asnIDs []string, family string) ([]string, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if !e.loadedV4 {
+	family = normalizeFamily(family)
+	if family != "ipv6" && !e.loadedV4 {
 		return nil, fmt.Errorf("ASN IPv4 data not loaded")
+	}
+	if family != "ipv4" && !e.loadedV6 {
+		return nil, fmt.Errorf("ASN IPv6 data not loaded")
 	}
 
 	wanted := make(map[string]struct{}, len(asnIDs))
@@ -512,25 +541,46 @@ func (e *ASNEngine) IPv4CIDRsForASNs(asnIDs []string) ([]string, error) {
 
 	seen := make(map[string]struct{})
 	cidrs := make([]string, 0)
-	for _, entries := range e.dataV4 {
-		for _, entry := range entries {
-			if _, ok := wanted[NormalizeASN(entry.asn)]; !ok {
-				continue
+	addEntry := func(entry asnEntry) {
+		if _, ok := wanted[NormalizeASN(entry.asn)]; !ok {
+			return
+		}
+		cidr := entry.cidrString
+		if cidr == "" {
+			return
+		}
+		if _, ok := seen[cidr]; ok {
+			return
+		}
+		seen[cidr] = struct{}{}
+		cidrs = append(cidrs, cidr)
+	}
+	if family != "ipv6" {
+		for _, entries := range e.dataV4 {
+			for _, entry := range entries {
+				addEntry(entry)
 			}
-			cidr := entry.cidrString
-			if cidr == "" || strings.Contains(cidr, ":") {
-				continue
-			}
-			if _, ok := seen[cidr]; ok {
-				continue
-			}
-			seen[cidr] = struct{}{}
-			cidrs = append(cidrs, cidr)
+		}
+	}
+	if family != "ipv4" {
+		for _, entry := range e.dataV6 {
+			addEntry(entry)
 		}
 	}
 
 	sort.Strings(cidrs)
 	return cidrs, nil
+}
+
+func normalizeFamily(family string) string {
+	switch strings.ToLower(strings.TrimSpace(family)) {
+	case "ipv6", "v6":
+		return "ipv6"
+	case "both", "all", "dual":
+		return "both"
+	default:
+		return "ipv4"
+	}
 }
 
 // SearchGroups returns grouped ASN matches for the interactive selector.

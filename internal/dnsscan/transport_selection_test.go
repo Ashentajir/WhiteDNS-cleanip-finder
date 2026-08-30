@@ -45,8 +45,8 @@ func TestTunnelPassAcceptsCleanTCPWhenUDPIsPoisoned(t *testing.T) {
 	r := ResolverResult{
 		Responded: true,
 		Probes: []DnsProbeResult{
-			{Protocol: "UDP/53", HeaderOK: true, Header: DnsHeader{QR: true, RA: true}, EDNS: true, IsPoisoned: true},
-			{Protocol: "TCP/53", HeaderOK: true, Header: DnsHeader{QR: true, RA: true}},
+			{Protocol: "UDP/53", Responded: true, HeaderOK: true, Header: DnsHeader{QR: true, RA: true}, EDNS: true, IsPoisoned: true},
+			{Protocol: "TCP/53", Responded: true, HeaderOK: true, Header: DnsHeader{QR: true, RA: true}},
 		},
 		TxtProbes: []DnsProbeResult{
 			{Protocol: "UDP/53", HeaderOK: true, Header: DnsHeader{QR: true, TC: true}},

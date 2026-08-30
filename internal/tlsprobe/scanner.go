@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -149,7 +150,7 @@ func dialWithRetries(ctx context.Context, ip string, port int, deadline time.Tim
 		}
 
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptBudget)
-		conn, err := (&net.Dialer{}).DialContext(attemptCtx, "tcp", fmt.Sprintf("%s:%d", ip, port))
+		conn, err := (&net.Dialer{}).DialContext(attemptCtx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
 		cancel()
 		if err == nil {
 			return conn, nil
@@ -400,12 +401,21 @@ func normalizePorts(cfg ScanConfig) []int {
 // are capped so large ASN networks are still scanned.
 const maxIPsPerCIDR = 65536
 
+// maxIPv6PerCIDR caps IPv6 prefixes far lower than IPv4 ones. A /64 holds 2^64
+// addresses of which only the low ones are ever assigned in practice, so
+// sweeping 65536 of them finds nothing and costs hours.
+// ponytail: low-address heuristic; add a per-prefix stride/host-list if real
+// deployments turn up outside ::0-::ff.
+const maxIPv6PerCIDR = 256
+
 // ExpandTargets is the exported form of expandTargets so callers can compute an
 // accurate probe total (expanded IPs x hostnames x ports) up front for progress.
 func ExpandTargets(raw []string) []string { return expandTargets(raw) }
 
 // expandTargets expands CIDR ranges and single IPs into a list of IP strings.
-// CIDRs larger than maxIPsPerCIDR are capped to the first maxIPsPerCIDR hosts.
+// Large IPv4 CIDRs are capped to their first hosts. Large IPv6 aggregates are
+// sampled across their /64 space instead of scanning only the first 256 values
+// of a /32 or /48, which almost never represents the routed ASN allocation.
 func expandTargets(raw []string) []string {
 	seen := make(map[string]struct{})
 	var out []string
@@ -419,11 +429,25 @@ func expandTargets(raw []string) []string {
 			if err != nil {
 				continue
 			}
+			perCIDRCap := maxIPsPerCIDR
+			if ip.To4() == nil {
+				perCIDRCap = maxIPv6PerCIDR
+			}
 			ones, bits := ipnet.Mask.Size()
 			shift := bits - ones
-			count := maxIPsPerCIDR + 1
+			count := perCIDRCap + 1
 			if shift < 31 {
 				count = 1 << shift
+			}
+			if ip.To4() == nil && count > perCIDRCap {
+				for _, ipStr := range sampleIPv6Prefix(ipnet, perCIDRCap) {
+					if _, ok := seen[ipStr]; ok {
+						continue
+					}
+					seen[ipStr] = struct{}{}
+					out = append(out, ipStr)
+				}
+				continue
 			}
 			startIP := ipToBigInt(ipnet.IP)
 			endIP := ipToBigInt(lastIP(ipnet))
@@ -449,10 +473,16 @@ func expandTargets(raw []string) []string {
 				}
 				continue
 			}
+			// IPv4 skips the network/broadcast addresses; IPv6 reserves neither,
+			// and "prefix::" is a common router/anycast address, so keep it.
 			firstHost := new(big.Int).Add(startIP, big.NewInt(1))
 			lastHost := new(big.Int).Sub(endIP, big.NewInt(1))
+			if ip.To4() == nil {
+				firstHost = new(big.Int).Set(startIP)
+				lastHost = endIP
+			}
 			added := 0
-			for cur := firstHost; cur.Cmp(lastHost) <= 0 && added < maxIPsPerCIDR; cur.Add(cur, big.NewInt(1)) {
+			for cur := firstHost; cur.Cmp(lastHost) <= 0 && added < perCIDRCap; cur.Add(cur, big.NewInt(1)) {
 				ipStr := bigIntToIP(cur, ip.To4() == nil)
 				if ipStr == "" {
 					continue
@@ -471,6 +501,67 @@ func expandTargets(raw []string) []string {
 				seen[s] = struct{}{}
 				out = append(out, s)
 			}
+		}
+	}
+	return out
+}
+
+// sampleIPv6Prefix returns representative addresses from a large IPv6 prefix.
+// Prefixes /64 and longer retain the useful low-address sweep. Broader routed
+// aggregates spread the budget across their /64s and use common low host IDs.
+func sampleIPv6Prefix(network *net.IPNet, limit int) []string {
+	if network == nil || limit <= 0 || network.IP.To4() != nil {
+		return nil
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 128 || ones < 0 {
+		return nil
+	}
+	start := ipToBigInt(network.IP.Mask(network.Mask))
+	if ones >= 64 {
+		out := make([]string, 0, limit)
+		cur := new(big.Int).Set(start)
+		for i := 0; i < limit; i++ {
+			ipStr := bigIntToIP(cur, true)
+			if ipStr == "" || !network.Contains(net.ParseIP(ipStr)) {
+				break
+			}
+			out = append(out, ipStr)
+			cur.Add(cur, big.NewInt(1))
+		}
+		return out
+	}
+
+	variableSubnetBits := uint(64 - ones)
+	maxSubnetIndex := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), variableSubnetBits), big.NewInt(1))
+	subnetCount := limit
+	if maxSubnetIndex.IsUint64() && maxSubnetIndex.Uint64()+1 < uint64(subnetCount) {
+		subnetCount = int(maxSubnetIndex.Uint64() + 1)
+	}
+	if subnetCount < 1 {
+		subnetCount = 1
+	}
+	commonHostIDs := []uint64{1, 0x53, 0, 2, 3, 0x35, 0x1111, 0x8888}
+	out := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		subnetSlot := i % subnetCount
+		hostRound := i / subnetCount
+		subnetIndex := new(big.Int)
+		if subnetCount > 1 {
+			subnetIndex.Mul(maxSubnetIndex, big.NewInt(int64(subnetSlot)))
+			subnetIndex.Div(subnetIndex, big.NewInt(int64(subnetCount-1)))
+		}
+		candidate := new(big.Int).Lsh(subnetIndex, 64)
+		candidate.Add(candidate, start)
+		hostID := commonHostIDs[hostRound%len(commonHostIDs)]
+		if hostRound >= len(commonHostIDs) {
+			hostID = uint64(hostRound - len(commonHostIDs) + 4)
+		}
+		candidate.Add(candidate, new(big.Int).SetUint64(hostID))
+		ipStr := bigIntToIP(candidate, true)
+		parsed := net.ParseIP(ipStr)
+		if parsed != nil && network.Contains(parsed) {
+			out = append(out, ipStr)
 		}
 	}
 	return out

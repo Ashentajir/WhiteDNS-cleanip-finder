@@ -210,7 +210,7 @@ func (s *Scanner) collectProxyCandidates(rawTargets []string, ports []int, disco
 					})
 				}
 				for _, port := range shuffledPorts {
-					candidates = append(candidates, fmt.Sprintf("%s:%d", ip, port))
+					candidates = append(candidates, hostPort(ip, port))
 				}
 			}
 		}

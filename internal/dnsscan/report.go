@@ -19,6 +19,7 @@ import (
 type ReportPaths struct {
 	Dir            string
 	Full           string // human-readable per-resolver + header dump
+	Valid          string // plain IP list of working, unpoisoned resolvers (usable DNS servers)
 	TunnelReady    string // tunnel-ready shortlist (human-readable)
 	TunnelReadyIPs string // plain IP list of tunnel-ready resolvers, one per line (E2E input)
 	Passed         string // plain IP list of clean (valid) resolvers, one per line
@@ -121,6 +122,10 @@ func WriteReports(dir string, results []ResolverResult) (ReportPaths, error) {
 	if err := writeFullReport(paths.Full, sorted); err != nil {
 		return paths, err
 	}
+	paths.Valid = filepath.Join(dir, fmt.Sprintf("valid_dns_servers_%s.txt", ts))
+	if err := writeValidList(paths.Valid, sorted); err != nil {
+		return paths, err
+	}
 	paths.TunnelReady = filepath.Join(dir, fmt.Sprintf("tunnel_ready_%s.txt", ts))
 	if err := writeTunnelReport(paths.TunnelReady, sorted); err != nil {
 		return paths, err
@@ -152,18 +157,48 @@ func WriteReports(dir string, results []ResolverResult) (ReportPaths, error) {
 	return paths, nil
 }
 
+// SortResults orders results best-first (tunnel-ready, then score, then IP) —
+// the same order the report files use, so callers can render a matching list.
+func SortResults(results []ResolverResult) []ResolverResult { return sortedResults(results) }
+
 func sortedResults(results []ResolverResult) []ResolverResult {
 	sorted := append([]ResolverResult(nil), results...)
 	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].Passed() != sorted[j].Passed() {
-			return sorted[i].Passed()
+		ri, rj := resultSortRank(sorted[i]), resultSortRank(sorted[j])
+		if ri != rj {
+			return ri < rj
 		}
 		if sorted[i].Score != sorted[j].Score {
 			return sorted[i].Score > sorted[j].Score // best first
 		}
+		if sorted[i].BestLatency != sorted[j].BestLatency {
+			if sorted[i].BestLatency == 0 {
+				return false
+			}
+			if sorted[j].BestLatency == 0 {
+				return true
+			}
+			return sorted[i].BestLatency < sorted[j].BestLatency
+		}
 		return sorted[i].IP < sorted[j].IP
 	})
 	return sorted
+}
+
+func resultSortRank(result ResolverResult) int {
+	if result.Passed() {
+		return 0
+	}
+	switch result.Status {
+	case StatusValid:
+		return 1
+	case StatusHijack:
+		return 2
+	case StatusPoison:
+		return 3
+	default:
+		return 4
+	}
 }
 
 func writeMobileDetailedReport(path string, results []ResolverResult) error {
@@ -247,7 +282,7 @@ func writeFullReport(path string, results []ResolverResult) error {
 	b.WriteString(strings.Repeat("=", 90))
 	b.WriteString("\n")
 	for _, r := range results {
-		fmt.Fprintf(&b, "\n%-21s [%s] score=%d/6 tunnel=%s via=%s poison=%v hijack=%v %dms\n",
+		fmt.Fprintf(&b, "\n%-39s [%s] score=%d/6 tunnel=%s via=%s poison=%v hijack=%v %dms\n",
 			r.IP, strings.ToUpper(r.Status), r.Score, ynb(r.TunnelReady), r.TunnelTransport, r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
 		fmt.Fprintf(&b, "    RA=%v EDNS0=%v TXT-pass=%v UDP=%v TCP=%v reason=%s\n",
 			r.RA, r.EDNS, r.TxtPass, r.UDPOK, r.TCPOK, r.TunnelReason)
@@ -285,10 +320,34 @@ func writeTunnelReport(path string, results []ResolverResult) error {
 			continue
 		}
 		count++
-		fmt.Fprintf(&b, "%-21s score=%d/6 via=%s poison=%v transparent=%v %dms\n",
+		fmt.Fprintf(&b, "%-39s score=%d/6 via=%s poison=%v transparent=%v %dms\n",
 			r.IP, r.Score, r.TunnelTransport, r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
 	}
 	fmt.Fprintf(&b, "\nTotal passed: %d\n", count)
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// ValidResolvers returns every resolver with at least one honest answer path
+// and no transparent-proxy hijack. A resolver may still show per-transport
+// poison evidence when, for example, UDP is injected but TCP is clean.
+func ValidResolvers(results []ResolverResult) []ResolverResult {
+	out := make([]ResolverResult, 0, len(results))
+	for _, r := range results {
+		if r.Status == StatusValid {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// writeValidList dumps working, unpoisoned resolver IPs one per line, ready to
+// paste into a resolv.conf / client DNS setting.
+func writeValidList(path string, results []ResolverResult) error {
+	var b strings.Builder
+	for _, r := range ValidResolvers(results) {
+		b.WriteString(r.IP)
+		b.WriteString("\n")
+	}
 	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
