@@ -38,20 +38,26 @@ var cloudflareEdgeCIDRs = []string{
 
 // EdgeProviders is the provider menu: Cloudflare plus the PaaS/edge platforms
 // that host reachable apps behind a small set of front IPs.
+//
+// A ProbeDomains entry may be a wildcard app suffix — netlify.app, pages.dev,
+// fly.dev, vercel.app, workers.dev — where no site exists at the apex and the
+// platform's own marketing address does not front it. These are the names users
+// actually need to reach, and an address that holds a certificate for one is the
+// app edge being hunted, so the scan credits a certificate match on its own
+// rather than requiring a page to come back. See RequiredProbeDomains in the
+// scanner.
 var EdgeProviders = []EdgeProvider{
 	{
 		Name:         "Cloudflare (CDN / Workers)",
 		Hosts:        CloudflareCNAMEDomains,
-		// pages.dev is a wildcard suffix, not a site: the edge refuses the
-		// handshake for the apex, so it can never confirm anything.
-		ProbeDomains: []string{"workers.dev", "static.cloudflareinsights.com", "speed.cloudflare.com"},
+		ProbeDomains: []string{"workers.dev", "pages.dev", "static.cloudflareinsights.com", "speed.cloudflare.com"},
 		Signatures:   []string{"cloudflare", "cf-ray"},
 		CIDRs:        cloudflareEdgeCIDRs,
 	},
 	{
 		Name:         "Cloudflare Pages (pages.dev)",
 		Hosts:        []string{"pages.cloudflare.com", "developers.cloudflare.com", "blog.cloudflare.com", "dash.cloudflare.com"},
-		ProbeDomains: []string{"pages.cloudflare.com", "workers.dev"},
+		ProbeDomains: []string{"pages.dev", "pages.cloudflare.com", "workers.dev"},
 		Signatures:   []string{"cloudflare", "cf-ray"},
 		CIDRs:        cloudflareEdgeCIDRs,
 	},
@@ -64,8 +70,7 @@ var EdgeProviders = []EdgeProvider{
 	{
 		Name:         "Fly.io (fly.dev)",
 		Hosts:        []string{"fly.io", "www.fly.io", "fly.dev", "community.fly.io", "api.machines.dev"},
-		// fly.dev is the wildcard app suffix; only fly.io is served.
-		ProbeDomains: []string{"fly.io"},
+		ProbeDomains: []string{"fly.dev", "fly.io"},
 		Signatures:   []string{"fly"},
 	},
 	{
@@ -86,8 +91,7 @@ var EdgeProviders = []EdgeProvider{
 	{
 		Name:         "Netlify (netlify.app)",
 		Hosts:        []string{"netlify.com", "www.netlify.com", "netlify.app", "docs.netlify.com", "app.netlify.com", "api.netlify.com"},
-		// netlify.app is the wildcard app suffix; only netlify.com is served.
-		ProbeDomains: []string{"netlify.com", "docs.netlify.com"},
+		ProbeDomains: []string{"netlify.app", "netlify.com", "docs.netlify.com"},
 		Signatures:   []string{"netlify"},
 	},
 	{

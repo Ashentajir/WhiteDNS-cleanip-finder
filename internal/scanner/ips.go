@@ -1319,6 +1319,20 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 	return result
 }
 
+// scopeAcceptsOnCertificate reports whether a certificate covering the probed
+// name should settle it on its own. It applies only to a scoped scan, and only
+// to the platform names that scan is looking for: those include wildcard app
+// suffixes with no site at the apex, where the edge serving the platform answers
+// every probe with 404 or 530. Requiring a page back would reject exactly the
+// addresses being hunted, while an edge refuses the handshake outright for a
+// suffix it does not front — so the certificate is the evidence.
+func scopeAcceptsOnCertificate(certOK bool, domain string, required []string) bool {
+	if !certOK || len(required) == 0 {
+		return false
+	}
+	return meetsRequiredDomains([]string{domain}, required)
+}
+
 // meetsRequiredDomains reports whether the passed domains satisfy the caller's
 // required set. An empty required set imposes no constraint.
 func meetsRequiredDomains(passed, required []string) bool {
@@ -1494,10 +1508,22 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 				continue
 			}
 
+			// The certificate is available now, and it is the whole answer to the
+			// scope question. Read it here: an edge fronting a wildcard app suffix
+			// has no page to return, and every path below gives up before this
+			// point when nothing comes back.
+			scopeCert := scopeAcceptsOnCertificate(
+				certMatchesDomain(tlsConn.ConnectionState(), domain), domain, opts.RequiredProbeDomains)
+
 			path := probePathForDomain(domain, attempt)
 			req := buildProbePayload(domain, path)
 			if _, err := tlsConn.Write([]byte(req)); err != nil {
 				tlsConn.Close()
+				if scopeCert {
+					result.Status = "accept"
+					result.Domain = domain
+					return domainOutcome{result: result, accepted: true, strong: true}
+				}
 				result.Status = "dead"
 				result.Error = err.Error()
 				continue
@@ -1506,6 +1532,12 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 			resp, readErr := readLimitedHTTPResponse(tlsConn, 8192)
 			if readErr != nil || len(resp) == 0 {
 				tlsConn.Close()
+				if scopeCert {
+					s.vlogf("[SCOPE] %s:%d fronts %s (certificate, no page); accepting\n", ip, port, domain)
+					result.Status = "accept"
+					result.Domain = domain
+					return domainOutcome{result: result, accepted: true, strong: true}
+				}
 				result.Status = "dead"
 				if readErr != nil {
 					result.Error = readErr.Error()
@@ -1543,6 +1575,20 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 				}
 			}
 			certOK := certMatchesDomain(state, domain)
+			// A scoped scan asks whether this address fronts the platform, and a
+			// certificate covering the name answers that on its own. It has to,
+			// for the names that matter most: a wildcard app suffix like
+			// *.netlify.app or *.pages.dev has no site at the apex, so the edge
+			// serving every app on the platform answers a probe with 404 or 530.
+			// Requiring a page back would reject exactly the addresses being
+			// hunted. An edge refuses the handshake outright for a suffix it does
+			// not front, so holding the certificate is the evidence.
+			if scopeCert {
+				if result.Status != "accept" {
+					s.vlogf("[SCOPE] %s:%d fronts %s (certificate); accepting without a page\n", ip, port, domain)
+				}
+				result.Status = "accept"
+			}
 			tlsConn.Close()
 			if result.Status == "accept" {
 				return domainOutcome{
