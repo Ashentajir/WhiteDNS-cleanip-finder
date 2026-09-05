@@ -30,6 +30,13 @@ var defaultProbeDomains = []string{
 	"claude.ai",
 }
 
+// DefaultProbeDomains returns the hostnames a plain IP scan probes every
+// candidate with. Callers that build a narrower probe list (an edge-provider
+// scan, say) merge these in so their results rest on the same evidence.
+func DefaultProbeDomains() []string {
+	return append([]string(nil), defaultProbeDomains...)
+}
+
 // probePayloadCache stores pre-built HTTP probe payloads to avoid repeated encoding
 var probePayloadCache = sync.Map{}
 

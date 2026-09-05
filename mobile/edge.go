@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"whitedns-go/internal/config"
-	"whitedns-go/internal/tlsprobe"
+	"whitedns-go/internal/scanner"
 )
 
 // EdgeProviderList returns the selectable edge platforms, one per line:
@@ -70,7 +70,7 @@ func selectedEdgeProvider(cfg *ScanConfig) *config.EdgeProvider {
 
 // defaultScanDomains is the standard probe set a plain IP scan uses, so a
 // scoped scan collects the same evidence on top of the platform check.
-func defaultScanDomains() []string { return tlsprobe.DefaultDomains() }
+func defaultScanDomains() []string { return scanner.DefaultProbeDomains() }
 
 // edgeSpeedSNI returns the hostname the speed test should present when a
 // platform is selected, so the pinned transfer reaches that edge rather than

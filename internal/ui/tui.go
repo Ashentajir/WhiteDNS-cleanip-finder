@@ -3448,7 +3448,14 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 				// to pass — so an accepted IP is one that really serves it, judged
 				// by the same evidence a plain IP scan collects.
 				if p := config.GetEdgeProvider(cfg.EdgeProvider); p != nil && len(p.ProbeDomains) > 0 {
-					domains := p.ScanDomains(tlsprobe.GetDomains(m.app.DataDir))
+					// The standard set is whichever one this scan would have used
+					// on its own: the IP scan's probe domains, or the SNI
+					// scanner's TLS hostname list.
+					standard := scanner.DefaultProbeDomains()
+					if opType == "sni_scanner" || opType == "desync_scanner" {
+						standard = tlsprobe.GetDomains(m.app.DataDir)
+					}
+					domains := p.ScanDomains(standard)
 					opts.ProbeDomainsHTTP = domains
 					opts.ProbeDomainsHTTPS = append([]string(nil), domains...)
 					opts.RequiredProbeDomains = p.RequiredScanDomains()
