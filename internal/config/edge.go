@@ -42,14 +42,16 @@ var EdgeProviders = []EdgeProvider{
 	{
 		Name:         "Cloudflare (CDN / Workers)",
 		Hosts:        CloudflareCNAMEDomains,
-		ProbeDomains: []string{"workers.dev", "pages.dev", "static.cloudflareinsights.com", "speed.cloudflare.com"},
+		// pages.dev is a wildcard suffix, not a site: the edge refuses the
+		// handshake for the apex, so it can never confirm anything.
+		ProbeDomains: []string{"workers.dev", "static.cloudflareinsights.com", "speed.cloudflare.com"},
 		Signatures:   []string{"cloudflare", "cf-ray"},
 		CIDRs:        cloudflareEdgeCIDRs,
 	},
 	{
 		Name:         "Cloudflare Pages (pages.dev)",
 		Hosts:        []string{"pages.cloudflare.com", "developers.cloudflare.com", "blog.cloudflare.com", "dash.cloudflare.com"},
-		ProbeDomains: []string{"pages.dev", "pages.cloudflare.com", "workers.dev"},
+		ProbeDomains: []string{"pages.cloudflare.com", "workers.dev"},
 		Signatures:   []string{"cloudflare", "cf-ray"},
 		CIDRs:        cloudflareEdgeCIDRs,
 	},
@@ -62,7 +64,8 @@ var EdgeProviders = []EdgeProvider{
 	{
 		Name:         "Fly.io (fly.dev)",
 		Hosts:        []string{"fly.io", "www.fly.io", "fly.dev", "community.fly.io", "api.machines.dev"},
-		ProbeDomains: []string{"fly.dev", "fly.io"},
+		// fly.dev is the wildcard app suffix; only fly.io is served.
+		ProbeDomains: []string{"fly.io"},
 		Signatures:   []string{"fly"},
 	},
 	{
@@ -83,7 +86,8 @@ var EdgeProviders = []EdgeProvider{
 	{
 		Name:         "Netlify (netlify.app)",
 		Hosts:        []string{"netlify.com", "www.netlify.com", "netlify.app", "docs.netlify.com", "app.netlify.com", "api.netlify.com"},
-		ProbeDomains: []string{"netlify.app", "netlify.com"},
+		// netlify.app is the wildcard app suffix; only netlify.com is served.
+		ProbeDomains: []string{"netlify.com", "docs.netlify.com"},
 		Signatures:   []string{"netlify"},
 	},
 	{
@@ -230,6 +234,13 @@ func (p EdgeProvider) Targets(resolved []string, wantIPv6 bool) []string {
 	for _, raw := range resolved {
 		ip := net.ParseIP(strings.TrimSpace(raw))
 		if ip == nil || covered(ip) {
+			continue
+		}
+		// A platform that publishes its ranges tells us where its edge is. An
+		// answer from outside them is a seed hostname that has moved on — parked,
+		// sold, or repointed — and widening it to a /24 would scan a stranger's
+		// network under this platform's name.
+		if len(published) > 0 {
 			continue
 		}
 		if v4 := ip.To4(); v4 != nil {

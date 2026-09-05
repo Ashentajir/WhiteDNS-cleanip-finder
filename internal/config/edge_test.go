@@ -28,24 +28,25 @@ func TestEdgeProvidersWellFormed(t *testing.T) {
 }
 
 func TestEdgeTargetsDropIPv6WithoutRoute(t *testing.T) {
-	p := EdgeProvider{CIDRs: []string{"104.16.0.0/13", "2606:4700::/32"}}
+	// No published ranges: targets come from DNS, so the v4 answer is widened
+	// and the v6 one is dropped on a host that cannot route it.
+	p := EdgeProvider{}
 	got := p.Targets([]string{"9.9.9.9", "2606:4701::1"}, false)
 	for _, target := range got {
 		if strings.Contains(target, ":") {
 			t.Errorf("IPv6 target %q kept on a host with no IPv6 route", target)
 		}
 	}
-	if len(got) != 2 {
-		t.Errorf("want the v4 /24 and the v4 range, got %v", got)
+	if len(got) != 1 || got[0] != "9.9.9.0/24" {
+		t.Errorf("want just the v4 /24, got %v", got)
 	}
 }
 
-func TestEdgeProviderTargets(t *testing.T) {
-	p := EdgeProvider{CIDRs: []string{"104.16.0.0/13"}}
-	// Live answers first, published ranges after; an address already inside a
-	// published range adds nothing and is dropped.
-	got := p.Targets([]string{"1.2.3.4", "1.2.3.9", "104.16.5.5", "2606:4700::1111", "not-an-ip", ""}, true)
-	want := []string{"1.2.3.0/24", "2606:4700::1111", "104.16.0.0/13"}
+func TestEdgeTargetsFromDNSOnly(t *testing.T) {
+	// A platform that publishes nothing is mapped entirely from what it answers.
+	p := EdgeProvider{}
+	got := p.Targets([]string{"1.2.3.4", "1.2.3.9", "2606:4700::1111", "not-an-ip", ""}, true)
+	want := []string{"1.2.3.0/24", "2606:4700::1111"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -53,5 +54,16 @@ func TestEdgeProviderTargets(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v, want %v", got, want)
 		}
+	}
+}
+
+func TestEdgeProviderTargets(t *testing.T) {
+	p := EdgeProvider{CIDRs: []string{"104.16.0.0/13"}}
+	// A platform that publishes its ranges is scanned inside them. An answer
+	// from outside is a seed hostname that has moved on, and widening it would
+	// scan a stranger's network under this platform's name.
+	got := p.Targets([]string{"104.16.5.5", "172.104.149.86", "not-an-ip", ""}, true)
+	if len(got) != 1 || got[0] != "104.16.0.0/13" {
+		t.Fatalf("want only the published range, got %v", got)
 	}
 }
