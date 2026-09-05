@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"whitedns-go/internal/config"
+	"whitedns-go/internal/tlsprobe"
 )
 
 // EdgeProviderList returns the selectable edge platforms, one per line:
@@ -22,41 +23,61 @@ func EdgeProviderList() string {
 }
 
 // EdgeProviderTargets resolves the named provider's seed hostnames and returns
-// its scan targets (published ranges, the /24 around every resolved IPv4, and
-// resolved IPv6 addresses), newline separated. It performs DNS lookups, so call
-// it off the UI thread.
+// its scan targets, newline separated: the /24 around every address the platform
+// answers with first, then its published ranges. IPv6 targets are left out on a
+// device with no IPv6 route. It performs DNS lookups, so call it off the UI
+// thread.
 func EdgeProviderTargets(name string) (string, error) {
 	p := config.GetEdgeProvider(name)
 	if p == nil {
 		return "", fmt.Errorf("unknown edge provider %q", name)
 	}
-	targets := p.Targets(p.Resolve())
+	targets := p.Targets(p.Resolve(), config.LocalIPv6Usable())
 	if len(targets) == 0 {
 		return "", fmt.Errorf("no edge IPs resolved for %s (check DNS)", name)
 	}
 	return strings.Join(targets, "\n"), nil
 }
 
-// edgeProbeDomains returns the probe hostnames for the config's selected edge
-// provider, or nil when none is selected. Scoping the probe to a platform's own
-// hostnames is what makes an accepted IP one that actually serves that platform.
+// edgeProbeDomains returns the hostnames a scan scoped to the config's edge
+// provider should probe: the platform's own names plus the standard set, so an
+// accepted IP is judged on the same evidence a plain IP scan collects. Returns
+// nil when no platform is selected.
 func edgeProbeDomains(cfg *ScanConfig) []string {
-	if cfg == nil {
-		return nil
-	}
-	p := config.GetEdgeProvider(strings.TrimSpace(cfg.EdgeProvider))
+	p := selectedEdgeProvider(cfg)
 	if p == nil {
 		return nil
 	}
-	return append([]string(nil), p.ProbeDomains...)
+	return p.ScanDomains(defaultScanDomains())
 }
+
+// edgeRequiredDomains returns the names at least one of which an endpoint must
+// serve before it counts as a hit for the selected platform.
+func edgeRequiredDomains(cfg *ScanConfig) []string {
+	p := selectedEdgeProvider(cfg)
+	if p == nil {
+		return nil
+	}
+	return p.RequiredScanDomains()
+}
+
+func selectedEdgeProvider(cfg *ScanConfig) *config.EdgeProvider {
+	if cfg == nil {
+		return nil
+	}
+	return config.GetEdgeProvider(strings.TrimSpace(cfg.EdgeProvider))
+}
+
+// defaultScanDomains is the standard probe set a plain IP scan uses, so a
+// scoped scan collects the same evidence on top of the platform check.
+func defaultScanDomains() []string { return tlsprobe.DefaultDomains() }
 
 // edgeSpeedSNI returns the hostname the speed test should present when a
 // platform is selected, so the pinned transfer reaches that edge rather than
 // only Cloudflare's.
 func edgeSpeedSNI(cfg *ScanConfig) string {
-	if domains := edgeProbeDomains(cfg); len(domains) > 0 {
-		return domains[0]
+	if p := selectedEdgeProvider(cfg); p != nil && len(p.ProbeDomains) > 0 {
+		return p.ProbeDomains[0]
 	}
 	return ""
 }

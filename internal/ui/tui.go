@@ -2289,7 +2289,7 @@ func (m tuiModel) handleEdgeMined(msg edgeMinedMsg) (tuiModel, tea.Cmd) {
 func cmdMineEdgeProvider(p config.EdgeProvider) tea.Cmd {
 	return func() tea.Msg {
 		ips := mineProviderIPs(p)
-		targets := p.Targets(ips)
+		targets := p.Targets(ips, config.LocalIPv6Usable())
 		if len(targets) == 0 {
 			return edgeMinedMsg{provider: p.Name, err: fmt.Errorf("no edge IPs resolved (check DNS)")}
 		}
@@ -3443,12 +3443,15 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 				if cfg.LowBandwidth {
 					opts.AdaptiveDomainConcurrency = 1
 				}
-				// An edge provider selection scopes every probe to that platform
-				// hostnames (workers.dev, vercel.app, onrender.com, ...), so an
-				// accepted IP is one that really serves that platform.
+				// An edge provider selection probes that platform's hostnames
+				// alongside the standard set, and requires one of the platform's
+				// to pass — so an accepted IP is one that really serves it, judged
+				// by the same evidence a plain IP scan collects.
 				if p := config.GetEdgeProvider(cfg.EdgeProvider); p != nil && len(p.ProbeDomains) > 0 {
-					opts.ProbeDomainsHTTP = append([]string(nil), p.ProbeDomains...)
-					opts.ProbeDomainsHTTPS = append([]string(nil), p.ProbeDomains...)
+					domains := p.ScanDomains(tlsprobe.GetDomains(m.app.DataDir))
+					opts.ProbeDomainsHTTP = domains
+					opts.ProbeDomainsHTTPS = append([]string(nil), domains...)
+					opts.RequiredProbeDomains = p.RequiredScanDomains()
 				}
 				if opType == "sni_scanner" || opType == "desync_scanner" {
 					// SNI scanner uses tlsprobe hostnames for the TLS hostname probe path.

@@ -71,8 +71,14 @@ fun EdgePickerScreen(
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                "Pick a platform. WhiteDNS resolves its front hostnames and stages the IPs behind them as scan targets.",
+                "Pick a platform. WhiteDNS resolves the hostnames it serves and scans the addresses behind them first, then its wider published ranges.",
                 style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "An IP counts as a hit only when it answers for the platform itself — the standard probe domains are checked too, but they cannot stand in for it.",
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -132,8 +138,9 @@ private fun EdgeProviderItem(
     enabled: Boolean,
     onClick: () -> Unit,
 ) {
-    // Amber marks a platform that publishes its ranges (a big target set out of
-    // the box); cyan marks one whose ranges are built from what DNS answers.
+    // Amber marks a platform that publishes its ranges, so the scan is long;
+    // cyan marks one whose targets come from DNS alone, so it is short. Same
+    // meaning the scan form gives those colours: amber is what costs you.
     val accent = if (row.publishesRanges) Amber else CyanAccent
     val ruleColor = if (resolving) accent else accent.copy(alpha = 0.45f)
     Row(
@@ -202,8 +209,10 @@ private fun probeSignature(domains: List<String>): String {
 }
 
 private fun metaLine(row: EdgeProviderRow): String =
-    if (row.publishesRanges) "${row.hosts} hostnames · ${row.ranges} published ranges"
-    else "${row.hosts} hostnames · ranges built from DNS"
+    if (row.publishesRanges)
+        "${row.hosts} hostnames · ${row.ranges} published ranges — long scan, stop it when you have enough"
+    else
+        "${row.hosts} hostnames · ranges built from DNS — short scan"
 
 private fun loadEdgeProviders(): List<EdgeProviderRow> = runCatching {
     Mobile.edgeProviderList()

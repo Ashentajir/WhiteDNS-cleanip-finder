@@ -2,6 +2,7 @@ package com.whitescan.app.ui
 
 import android.content.ClipboardManager
 import android.content.Context
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
@@ -16,10 +17,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.whitescan.app.ScanKind
@@ -145,7 +148,7 @@ fun ScanConfigForm(
 
             // ── Targets ──────────────────────────────────────────────────────
             item {
-                FormSection("TARGETS") {
+                FormSection("TARGETS", summary = targetSummary(form.targets)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -216,7 +219,7 @@ fun ScanConfigForm(
             // ── Ports (everything but DNS, which couples port to transport) ───
             if (kind != ScanKind.DNS) {
                 item {
-                    FormSection("PORTS") {
+                    FormSection("PORTS", summary = portSummary(form.ports)) {
                         FlowRow(
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -355,7 +358,7 @@ fun ScanConfigForm(
             // ── SNI domains + match mode (SNI scan only) ─────────────────────
             if (kind == ScanKind.SNI) {
                 item {
-                    FormSection("SNI DOMAINS") {
+                    FormSection("SNI DOMAINS", summary = if (form.sniStrict) "strict" else "lenient") {
                         Text(
                             "Leave blank to probe the built-in list",
                             style = MaterialTheme.typography.bodySmall,
@@ -408,7 +411,7 @@ fun ScanConfigForm(
 
             // ── Scan rate ────────────────────────────────────────────────────────
             item {
-                FormSection("SCAN RATE") {
+                FormSection("SCAN RATE", accent = SectionCost, summary = rateSummary(form)) {
                     val currentLabel = if (showCustomWorkers) "Custom (${form.concurrency} workers)"
                     else CONCURRENCY_PRESETS.find {
                         it.value == form.concurrency && it.lowBw == form.lowBandwidth
@@ -496,7 +499,7 @@ fun ScanConfigForm(
             // ── After the scan ───────────────────────────────────────────────
             if (kind == ScanKind.IP || kind == ScanKind.DNS) {
                 item {
-                    FormSection("AFTER THE SCAN") {
+                    FormSection("AFTER THE SCAN", accent = SectionAfter) {
                         if (kind == ScanKind.IP) {
                             SwitchRow(
                                 checked = form.speedTestEnabled,
@@ -557,7 +560,7 @@ fun ScanConfigForm(
 
             // ── Advanced — set once, rarely touched again ────────────────────
             item {
-                FormSection("ADVANCED") {
+                FormSection("ADVANCED", accent = SectionCost, summary = advancedSummary(form)) {
                     TextButton(
                         onClick = { showAdvanced = !showAdvanced },
                         modifier = Modifier.fillMaxWidth().height(44.dp),
@@ -609,37 +612,82 @@ fun ScanConfigForm(
                 }
                 Button(
                     onClick = onStart,
-                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    modifier = Modifier.fillMaxWidth().height(54.dp),
                     enabled = form.targets.isNotBlank(),
                 ) {
                     Text("Start scan", style = MaterialTheme.typography.titleSmall)
+                    if (form.targets.isNotBlank()) {
+                        Text(
+                            "  ${targetSummary(form.targets)} · ${portSummary(form.ports)}",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                        )
+                    }
                 }
             }
         }
     }
 }
 
-// One group of settings. The mono label is the app's section marker — the same
-// device the edge picker uses — so the form reads as a few blocks instead of one
-// long strip of controls.
+// A section's accent says what kind of setting it holds, not just where one
+// group ends and the next begins: cyan for what gets scanned, amber for the
+// knobs that spend battery, radio and exposure, lavender for what runs
+// afterwards. The rail carrying that colour is the same device the edge picker
+// uses, so the two screens read as one instrument.
+private val SectionScan = CyanAccent
+private val SectionCost = Amber
+private val SectionAfter = Lavender
+
+// One group of settings. The header carries the section's current value on the
+// right, so scrolling the form reads back the whole configuration without
+// opening anything.
 @Composable
-private fun FormSection(label: String, content: @Composable ColumnScope.() -> Unit) {
+private fun FormSection(
+    label: String,
+    accent: Color = SectionScan,
+    summary: String? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
     Surface(
-        color = MaterialTheme.colorScheme.surface,
+        color = MaterialTheme.colorScheme.surfaceVariant,
         shape = MaterialTheme.shapes.medium,
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(horizontal = 14.dp, vertical = 14.dp)) {
-            Text(
-                label,
-                fontFamily = FontFamily.Monospace,
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 2.sp,
-                color = CyanAccent,
+        Row(Modifier.height(IntrinsicSize.Min)) {
+            Box(
+                Modifier
+                    .width(3.dp)
+                    .fillMaxHeight()
+                    .background(accent.copy(alpha = 0.8f)),
             )
-            Spacer(Modifier.height(10.dp))
-            content()
+            Column(Modifier.padding(start = 14.dp, end = 14.dp, top = 13.dp, bottom = 14.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        label,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 2.sp,
+                        color = accent,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    if (!summary.isNullOrBlank()) {
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            summary,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            letterSpacing = 0.3.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                            textAlign = TextAlign.End,
+                            maxLines = 1,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                content()
+            }
         }
     }
 }
@@ -675,16 +723,59 @@ private fun SwitchRow(
     }
 }
 
-// Engine values echoed back to the user in the app's data face.
+// Engine values echoed back to the user. Anything the engine will actually read
+// is set in the data face on a recessed ground, so a value is never mistaken for
+// the sentence explaining it.
 @Composable
 private fun DataLine(text: String) {
-    Text(
-        text,
-        fontFamily = FontFamily.Monospace,
-        fontSize = 12.sp,
-        letterSpacing = 0.4.sp,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
+    Surface(
+        color = MaterialTheme.colorScheme.background,
+        shape = MaterialTheme.shapes.extraSmall,
+    ) {
+        Text(
+            text,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            letterSpacing = 0.4.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+        )
+    }
+}
+
+// ── header summaries ─────────────────────────────────────────────────────
+// Each reads back what the section is currently set to, in one line.
+
+private fun targetSummary(targets: String): String {
+    val n = targets.split('\n', ',', ' ').count { it.isNotBlank() }
+    return when (n) {
+        0 -> "none"
+        1 -> "1 range"
+        else -> "$n ranges"
+    }
+}
+
+private fun portSummary(ports: String): String {
+    if (ports.isBlank()) return "defaults"
+    val n = ports.split(',').count { it.isNotBlank() }
+    return if (n == 1) ports.trim() else "$n ports"
+}
+
+private fun rateSummary(form: FormState): String {
+    val effort = when {
+        form.lowBandwidth || form.liteMode -> "balanced"
+        form.fastMode -> "fast"
+        else -> "balanced"
+    }
+    return "${form.concurrency} workers · $effort"
+}
+
+private fun advancedSummary(form: FormState): String {
+    val on = buildList {
+        if (form.liteMode) add("lite")
+        if (form.verboseLog) add("verbose")
+    }
+    return if (on.isEmpty()) "off" else on.joinToString(" · ")
 }
 
 // Shown once a platform is chosen: names what the scan is scoped to and the

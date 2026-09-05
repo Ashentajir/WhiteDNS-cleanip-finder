@@ -4,6 +4,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // EdgeProvider describes a CDN / PaaS edge network whose front IPs can be
@@ -134,6 +135,53 @@ func ResolveHosts(hosts []string) []string {
 	return ips
 }
 
+// LocalIPv6Usable reports whether this host has a usable IPv6 route. A UDP
+// "dial" sends no packets, so this only asks the kernel whether it can pick a
+// source address for a global IPv6 destination. Callers use it to keep IPv6
+// targets out of a scan that could only time out on them.
+func LocalIPv6Usable() bool {
+	conn, err := (&net.Dialer{Timeout: 2 * time.Second}).Dial("udp6", "[2001:4860:4860::8888]:53")
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// ScanDomains returns the hostnames a scan scoped to this provider should probe:
+// the platform's own names first, then the standard set the plain IP scan uses.
+// Both matter and they answer different questions — the platform names say the
+// IP is that platform's edge, the standard names say it carries real traffic to
+// the services people are trying to reach — so a scoped scan asks both and
+// requires the first (see RequiredScanDomains).
+//
+// The platform names come first so a fast scan confirms the one that decides the
+// verdict before it stops.
+func (p EdgeProvider) ScanDomains(standard []string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, group := range [][]string{p.ProbeDomains, standard} {
+		for _, d := range group {
+			d = strings.ToLower(strings.TrimSpace(d))
+			if d == "" {
+				continue
+			}
+			if _, ok := seen[d]; ok {
+				continue
+			}
+			seen[d] = struct{}{}
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// RequiredScanDomains returns the names at least one of which an endpoint must
+// serve to count as a hit for this platform.
+func (p EdgeProvider) RequiredScanDomains() []string {
+	return append([]string(nil), p.ProbeDomains...)
+}
+
 // GetEdgeProvider returns the provider with the given Name, or nil.
 func GetEdgeProvider(name string) *EdgeProvider {
 	for i := range EdgeProviders {
@@ -144,12 +192,34 @@ func GetEdgeProvider(name string) *EdgeProvider {
 	return nil
 }
 
-// Targets turns resolved edge IPs into a scan target list: the provider's
-// published ranges, plus the /24 around every resolved IPv4 (neighbouring edge
-// IPs live there) and the resolved IPv6 addresses as-is. Order is preserved and
-// duplicates dropped.
+// Targets turns resolved edge IPs into a scan target list.
+//
+// Order is the point: the /24 around every address the platform's hostnames
+// actually resolve to comes first, then the published ranges. Those /24s are
+// where the edge is answering right now, and a scan that is stopped early — the
+// normal case on a phone — should have spent its time there rather than walking
+// the front of a /13. A /24 already inside a published range is dropped, since
+// scanning it twice buys nothing.
+//
+// wantIPv6 is false on a host with no IPv6 route: the provider's v6 ranges are
+// then dead weight that would spend the whole scan timing out.
 // ponytail: /24 widening only; walk the owning ASN prefix if that proves too narrow.
-func (p EdgeProvider) Targets(resolved []string) []string {
+func (p EdgeProvider) Targets(resolved []string, wantIPv6 bool) []string {
+	published := make([]*net.IPNet, 0, len(p.CIDRs))
+	for _, c := range p.CIDRs {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			published = append(published, n)
+		}
+	}
+	covered := func(ip net.IP) bool {
+		for _, n := range published {
+			if n.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(t string) {
@@ -159,19 +229,25 @@ func (p EdgeProvider) Targets(resolved []string) []string {
 		seen[t] = struct{}{}
 		out = append(out, t)
 	}
-	for _, c := range p.CIDRs {
-		add(c)
-	}
+
 	for _, raw := range resolved {
 		ip := net.ParseIP(strings.TrimSpace(raw))
-		if ip == nil {
+		if ip == nil || covered(ip) {
 			continue
 		}
 		if v4 := ip.To4(); v4 != nil {
 			add(net.IPv4(v4[0], v4[1], v4[2], 0).String() + "/24")
 			continue
 		}
-		add(ip.String())
+		if wantIPv6 {
+			add(ip.String())
+		}
+	}
+	for _, c := range p.CIDRs {
+		if !wantIPv6 && strings.Contains(c, ":") {
+			continue
+		}
+		add(c)
 	}
 	return out
 }

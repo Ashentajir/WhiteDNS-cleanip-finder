@@ -191,6 +191,13 @@ type IPScanOptions struct {
 	// 2000 on large scans. Mobile sets this so it never saturates a phone's
 	// bandwidth / fd table (which disconnects the device and yields zero results).
 	DisableAutoConcurrency bool
+	// RequiredProbeDomains narrows what counts as a hit: when set, an endpoint
+	// is accepted only if at least one of the domains it passed is in this set.
+	// An edge-provider scan probes the platform's own hostnames alongside the
+	// standard ones — the standard set says the IP carries real traffic, the
+	// platform set says it is that platform's edge — and only the second answers
+	// the question the user asked, so it is the one that has to pass.
+	RequiredProbeDomains []string
 	// FastMode trades thoroughness for wall-clock time: an endpoint stops
 	// probing domains as soon as enough of them have confirmed it, probes are
 	// not retried, per-attempt timeouts drop the padding added for flaky links,
@@ -1249,8 +1256,11 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 				copyResult := *outcome.result
 				bestResult = &copyResult
 			}
-			if opts.FastMode && domainScore >= acceptThreshold {
-				// Verdict reached; the remaining domains cannot change it.
+			if opts.FastMode && domainScore >= acceptThreshold &&
+				meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+				// Verdict reached; the remaining domains cannot change it. The
+				// required set has to be satisfied first, or stopping here would
+				// reject an endpoint whose platform domain was never probed.
 				cancelProbes()
 			}
 			continue
@@ -1273,6 +1283,10 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 				bestResult.Error = fmt.Sprintf("insufficient domain confirmations: %d/%d", domainScore, acceptThreshold)
 			}
 			s.vlogf("[NOISE] %s:%d only %d/%d domains confirmed; rejecting to avoid ISP noise\n", ip, port, domainScore, acceptThreshold)
+		} else if !meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+			bestResult.Status = "reject"
+			bestResult.Error = "no required domain confirmed: " + strings.Join(opts.RequiredProbeDomains, ",")
+			s.vlogf("[SCOPE] %s:%d passed %v but none of the required domains; rejecting\n", ip, port, result.PassedDomains)
 		}
 		s.vlogf("[SCORE] %s:%d domains %d/%d passed:[%s]\n", ip, port, domainScore, len(domains), strings.Join(result.PassedDomains, ","))
 		return bestResult
@@ -1283,6 +1297,24 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 	s.vlogf("[SCORE] %s:%d domains %d/%d passed:[%s]\n", ip, port, domainScore, len(domains), strings.Join(result.PassedDomains, ","))
 
 	return result
+}
+
+// meetsRequiredDomains reports whether the passed domains satisfy the caller's
+// required set. An empty required set imposes no constraint.
+func meetsRequiredDomains(passed, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	want := make(map[string]struct{}, len(required))
+	for _, d := range required {
+		want[normalizedDomain(d)] = struct{}{}
+	}
+	for _, d := range passed {
+		if _, ok := want[normalizedDomain(d)]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func minimumDomainAcceptScore(domainCount int) int {
@@ -1529,8 +1561,9 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 				copyResult := *outcome.result
 				bestResult = &copyResult
 			}
-			if opts.FastMode {
-				// One confirmation is this path's accept rule; stop the rest.
+			if opts.FastMode && meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+				// One confirmation is this path's accept rule; stop the rest once
+				// the required set (if any) has actually been satisfied.
 				cancelProbes()
 			}
 			continue
@@ -1547,6 +1580,11 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 		bestResult.DomainTotal = len(domains)
 		bestResult.DomainsTested = len(domains)
 		bestResult.PassedDomains = result.PassedDomains
+		if !meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+			bestResult.Status = "reject"
+			bestResult.Error = "no required domain confirmed: " + strings.Join(opts.RequiredProbeDomains, ",")
+			s.vlogf("[SCOPE] %s:%d passed %v but none of the required domains; rejecting\n", ip, port, result.PassedDomains)
+		}
 		s.vlogf("[SCORE] %s:%d domains %d/%d passed:[%s]\n", ip, port, domainScore, len(domains), strings.Join(result.PassedDomains, ","))
 		return bestResult
 	}

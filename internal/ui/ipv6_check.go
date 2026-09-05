@@ -4,6 +4,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"whitedns-go/internal/config"
 )
 
 // hasIPv6Target reports whether any target is an IPv6 address or prefix.
@@ -23,17 +25,8 @@ func hasIPv6Target(targets []string) bool {
 	return false
 }
 
-// localIPv6Usable reports whether this host has a usable IPv6 route. A UDP
-// "dial" sends no packets, so this only asks the kernel whether it can pick a
-// source address for a global IPv6 destination.
-func localIPv6Usable() bool {
-	conn, err := (&net.Dialer{Timeout: 2 * time.Second}).Dial("udp6", "[2001:4860:4860::8888]:53")
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
+// localIPv6Usable reports whether this host has a usable IPv6 route.
+func localIPv6Usable() bool { return config.LocalIPv6Usable() }
 
 // warnIfNoIPv6 logs a warning when IPv6 targets are queued on a host without an
 // IPv6 route — otherwise every probe fails instantly and the scan looks broken.
