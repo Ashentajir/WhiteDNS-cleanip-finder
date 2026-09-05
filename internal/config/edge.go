@@ -68,7 +68,10 @@ var EdgeProviders = []EdgeProvider{
 	{
 		Name:         "Railway (up.railway.app)",
 		Hosts:        []string{"railway.com", "railway.app", "docs.railway.com", "backboard.railway.app", "up.railway.app"},
-		ProbeDomains: []string{"up.railway.app", "railway.app", "railway.com"},
+		// railway.app itself is fronted by Cloudflare, so it identifies Cloudflare
+		// rather than Railway. Only the names Railway serves from its own address
+		// space belong here.
+		ProbeDomains: []string{"up.railway.app", "railway.com"},
 		Signatures:   []string{"railway"},
 	},
 	{
