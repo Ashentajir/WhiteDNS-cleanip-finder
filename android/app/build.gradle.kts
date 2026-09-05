@@ -4,7 +4,7 @@ plugins {
 }
 
 val appVersionCode = 14
-val appVersionName = "1.4.2"
+val appVersionName = "1.4.3"
 
 android {
     namespace = "com.whitescan.app"
