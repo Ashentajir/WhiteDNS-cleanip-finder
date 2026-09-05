@@ -1,13 +1,12 @@
 name: Build Desktop Multi-Platform
 
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     branches:
       - main
       - "agent/**"
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -26,9 +25,9 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: Test
-        run: go test ./...
+        run: go test -short ./...
       - name: Vet scanner and mobile API
-        run: go vet ./internal/dnsscan ./mobile
+        run: go vet ./internal/dnsscan ./internal/scanner ./mobile
 
   build:
     needs: test

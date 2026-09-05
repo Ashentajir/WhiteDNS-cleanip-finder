@@ -1,10 +1,8 @@
 name: Build Android APK
 
 on:
+  workflow_call:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
 # GOTOOLCHAIN=local â€” stops Go from trying to download the non-existent Go 1.26
 # declared in go.mod. Go 1.25 (installed below) is used for everything.
@@ -157,7 +155,4 @@ jobs:
           path: android/release-artifacts/*
           retention-days: 30
 
-      # No automatic GitHub Release on this (org) repo: releases here are created
-      # manually by the maintainer. CI still builds and signs the APK/AAB and
-      # keeps them in the 30-day workflow artifact above to download and attach.
-
+      # The coordinating release workflow publishes these artifacts after all builds pass.

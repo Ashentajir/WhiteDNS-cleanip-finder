@@ -9,32 +9,50 @@ import (
 	"time"
 )
 
-func TestDefaultSpeedEndpointsOrderAndNames(t *testing.T) {
-	eps := DefaultSpeedEndpoints(10 * 1024 * 1024)
-	if len(eps) != 4 {
-		t.Fatalf("expected 4 download endpoints, got %d", len(eps))
-	}
-	wantNames := []string{"cloudflare", "cachefly", "hetzner", "google-204"}
-	for i, want := range wantNames {
-		if eps[i].Name != want {
-			t.Fatalf("endpoint %d: want name %q, got %q", i, want, eps[i].Name)
+func TestDefaultSpeedEndpointsArePinnedToCandidate(t *testing.T) {
+	// An endpoint that resolves normally measures the machine's own uplink, not
+	// the candidate IP, so every candidate scores the same. Guard against one
+	// creeping back in.
+	for _, sni := range []string{"speed.cloudflare.com", "workers.dev"} {
+		eps := DefaultSpeedEndpoints(10*1024*1024, sni)
+		if len(eps) == 0 {
+			t.Fatalf("sni %s: no download endpoints", sni)
+		}
+		if eps[0].Name != "cloudflare" {
+			t.Fatalf("sni %s: want cloudflare first, got %q", sni, eps[0].Name)
+		}
+		for _, ep := range eps {
+			if !ep.PinToCandidate {
+				t.Errorf("sni %s: endpoint %q is not pinned to the candidate IP", sni, ep.Name)
+			}
 		}
 	}
-	if !eps[0].PinToCandidate {
-		t.Fatalf("cloudflare endpoint must be PinToCandidate")
+	if len(DefaultSpeedEndpoints(1, "workers.dev")) != 2 {
+		t.Error("a non-Cloudflare SNI should add its own root as a second endpoint")
 	}
-	if eps[1].PinToCandidate || eps[2].PinToCandidate || eps[3].PinToCandidate {
-		t.Fatalf("only cloudflare should be PinToCandidate")
+	for _, ep := range DefaultUploadEndpoints() {
+		if !ep.PinToCandidate {
+			t.Errorf("upload endpoint %q is not pinned to the candidate IP", ep.Name)
+		}
 	}
-	if !eps[3].Reachability {
-		t.Fatalf("google-204 must be Reachability-only")
+}
+
+func TestCopyForWindowStopsAtWindow(t *testing.T) {
+	// A body that never ends must still yield a measurement.
+	n, err := copyForWindow(slowInfiniteReader{delay: 20 * time.Millisecond}, 150*time.Millisecond)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if eps[1].URL != "https://cachefly.cachefly.net/10mb.test" {
-		t.Fatalf("unexpected cachefly URL: %s", eps[1].URL)
+	if n <= 0 {
+		t.Fatal("expected some bytes to be counted")
 	}
-	if eps[2].URL != "https://speed.hetzner.de/100MB.bin" {
-		t.Fatalf("unexpected hetzner URL: %s", eps[2].URL)
-	}
+}
+
+type slowInfiniteReader struct{ delay time.Duration }
+
+func (r slowInfiniteReader) Read(p []byte) (int, error) {
+	time.Sleep(r.delay)
+	return len(p), nil
 }
 
 func TestMeasureUploadFallsBackOnFirstEndpointFailure(t *testing.T) {
@@ -81,21 +99,5 @@ func TestDedupeIPsStripsPortsAndDropsNonIPs(t *testing.T) {
 		if !want[ip] {
 			t.Fatalf("unexpected token survived dedupe: %q (full: %v)", ip, got)
 		}
-	}
-}
-
-func TestDefaultUploadEndpointsOrderAndNames(t *testing.T) {
-	eps := DefaultUploadEndpoints()
-	wantNames := []string{"cloudflare", "postman-echo", "httpbin"}
-	if len(eps) != len(wantNames) {
-		t.Fatalf("expected %d upload endpoints, got %d", len(wantNames), len(eps))
-	}
-	for i, want := range wantNames {
-		if eps[i].Name != want {
-			t.Fatalf("endpoint %d: want name %q, got %q", i, want, eps[i].Name)
-		}
-	}
-	if !eps[0].PinToCandidate {
-		t.Fatalf("cloudflare upload endpoint must be PinToCandidate")
 	}
 }

@@ -152,7 +152,7 @@ func (a *App) startGoProxy(mode string) {
 func drawHeader(cfg config.Config, mode string) {
 	clearScreen()
 	fmt.Println("------------------------------------------------------------")
-	fmt.Println(" WHITEDNS v1.4.0 ")
+	fmt.Println(" WHITEDNS v1.4.1 ")
 	fmt.Println(" developed by TAjirax ")
 	fmt.Println("------------------------------------------------------------")
 	uiLabel := "WhiteDNS"
@@ -713,73 +713,46 @@ func loadSNIPatterns() []string {
 }
 
 func mineCloudflareIPs() []string {
-	patterns := config.CloudflareCNAMEDomains
-	if len(patterns) == 0 {
-		patterns = loadSNIPatterns()
+	return mineProviderIPs(config.EdgeProviders[0])
+}
+
+// mineProviderIPs resolves a provider's seed hostnames (its workers / pages /
+// app domains) into candidate edge IPs, falling back to the bundled SNI pattern
+// list for a provider that ships no hosts of its own.
+func mineProviderIPs(p config.EdgeProvider) []string {
+	if len(p.Hosts) == 0 {
+		return config.ResolveHosts(loadSNIPatterns())
 	}
-	if len(patterns) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{})
-	var ips []string
-	for _, domain := range patterns {
-		resolved, err := net.LookupIP(domain)
-		if err != nil {
-			continue
-		}
-		for _, ip := range resolved {
-			ip4 := ip.To4()
-			if ip4 == nil {
-				continue
-			}
-			s := ip4.String()
-			if _, ok := seen[s]; ok {
-				continue
-			}
-			seen[s] = struct{}{}
-			ips = append(ips, s)
-		}
-	}
-	return ips
+	return p.Resolve()
 }
 
 func verifyCloudflareIP(ip string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(ip, "443"), &tls.Config{
-		ServerName:         "speed.cloudflare.com",
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12,
-	})
-	if err != nil {
-		_ = ctx
-		return false
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: speed.cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"); err != nil {
-		return false
-	}
-
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if n <= 0 || err != nil && err != io.EOF {
-		return false
-	}
-	resp := strings.ToLower(string(buf[:n]))
-	blocked := []string{"peyvandha.ir", "10.10.3", "internet.ir", "cra.ir"}
-	for _, sig := range blocked {
-		if strings.Contains(resp, sig) {
-			return false
-		}
-	}
-	return strings.Contains(resp, "http/") && strings.Contains(resp, "cloudflare")
+	return verifyProviderIP(ip, config.EdgeProviders[0])
 }
 
-func verifySNIPair(ip, sni string) bool {
+// verifyProviderIP reports whether ip actually fronts the given provider: the
+// answer must be HTTP and carry one of the provider's signatures.
+func verifyProviderIP(ip string, p config.EdgeProvider) bool {
+	sni := "speed.cloudflare.com"
+	if len(p.ProbeDomains) > 0 {
+		sni = p.ProbeDomains[0]
+	}
+	resp := probeTLSHost(ip, sni)
+	if !strings.Contains(resp, "http/") {
+		return false
+	}
+	for _, sig := range p.Signatures {
+		if strings.Contains(resp, sig) {
+			return true
+		}
+	}
+	return len(p.Signatures) == 0
+}
+
+// probeTLSHost dials ip:443 with sni, sends a Host: sni request and returns
+// the lowercased response head. Empty means unusable: dial, handshake or read
+// failed, or a known block page answered.
+func probeTLSHost(ip, sni string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -791,29 +764,33 @@ func verifySNIPair(ip, sni string) bool {
 		MinVersion:         tls.VersionTLS12,
 	})
 	if err != nil {
-		return false
+		return ""
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	probe := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n", sni)
 	if _, err := io.WriteString(conn, probe); err != nil {
-		return false
+		return ""
 	}
 
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
 	if n <= 0 || err != nil && err != io.EOF {
-		return false
+		return ""
 	}
 	resp := strings.ToLower(string(buf[:n]))
 	blocked := []string{"peyvandha.ir", "10.10.3", "internet.ir", "cra.ir"}
 	for _, sig := range blocked {
 		if strings.Contains(resp, sig) {
-			return false
+			return ""
 		}
 	}
-	return strings.Contains(resp, "http/")
+	return resp
+}
+
+func verifySNIPair(ip, sni string) bool {
+	return strings.Contains(probeTLSHost(ip, sni), "http/")
 }
 
 func sortedMapKeys(values map[string][]string) []string {

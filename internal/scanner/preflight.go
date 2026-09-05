@@ -246,10 +246,12 @@ func (s *Scanner) masscanNormalScale(ranges []IPRange, rate, retries, wait int, 
 	// Collect all IPs
 	var allIPs []string
 	for _, r := range ranges {
-		start := ipToInt(r.Start)
-		end := ipToInt(r.End)
+		start, end, ok := rangeBounds(r)
+		if !ok {
+			continue
+		}
 		for current := start; current <= end; current++ {
-			allIPs = append(allIPs, intToIP(current).String())
+			allIPs = append(allIPs, ipv4String(current))
 		}
 	}
 
@@ -328,8 +330,10 @@ func (s *Scanner) masscanLargeScale(ranges []IPRange, rate, retries, wait int, r
 
 	chunkIdx := 0
 	for _, r := range ranges {
-		start := ipToInt(r.Start)
-		end := ipToInt(r.End)
+		start, end, ok := rangeBounds(r)
+		if !ok {
+			continue
+		}
 
 		for current := start; current <= end; {
 			wg.Add(1)
@@ -399,8 +403,10 @@ func (s *Scanner) masscanMassiveScale(ranges []IPRange, rate, retries, wait int,
 
 	// Process ranges with worker pool
 	for _, r := range ranges {
-		start := ipToInt(r.Start)
-		end := ipToInt(r.End)
+		start, end, ok := rangeBounds(r)
+		if !ok {
+			continue
+		}
 
 		for current := start; current <= end; {
 			chunkEnd := current + int64(chunkSize)
@@ -470,7 +476,7 @@ func (s *Scanner) masscanChunk(chunkIdx int, startIP, endIP int64, rate, retries
 	// Generate IPs for chunk
 	var ips []string
 	for current := startIP; current < endIP; current++ {
-		ips = append(ips, intToIP(current).String())
+		ips = append(ips, ipv4String(current))
 	}
 
 	if len(ips) == 0 {

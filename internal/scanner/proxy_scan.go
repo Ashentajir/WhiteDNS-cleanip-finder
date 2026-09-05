@@ -1,13 +1,16 @@
 package scanner
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +20,12 @@ import (
 const (
 	defaultHTTPScanTimeout   = 8 * time.Second
 	defaultSOCKS5ScanTimeout = 5 * time.Second
+	// maxProxyIPsPerRange bounds how many addresses one target range contributes
+	// to direct discovery. Candidates are held in memory as ip:port strings, so
+	// an uncapped /8 across eight ports is ~130M strings and an OOM.
+	// ponytail: a flat cap, not a sampler — raise it if wide ranges matter more
+	// than the memory ceiling.
+	maxProxyIPsPerRange = 65536
 )
 
 // Default and extended port lists must match Python scanner.py exactly
@@ -58,9 +67,7 @@ func waveTimeouts(base time.Duration) (w1, w2, w3 time.Duration) {
 }
 
 var (
-	httpStatusPrefix11 = []byte("HTTP/1.1 200")
-	httpStatusPrefix10 = []byte("HTTP/1.0 200")
-	exampleDomainSig   = []byte("Example Domain")
+	exampleDomainSig = []byte("Example Domain")
 )
 
 // ProxyScanOptions controls discovery and verification of HTTP/SOCKS5 proxies.
@@ -191,18 +198,39 @@ func (s *Scanner) collectProxyCandidates(rawTargets []string, ports []int, disco
 	switch discovery {
 	case "direct":
 		s.logf("[DEBUG] using direct method (no external tool)\n")
-		ranges := ParseIPRanges(rawTargets)
+		var candidates []string
+		rangeTargets := make([]string, 0, len(rawTargets))
+		for _, target := range rawTargets {
+			target = strings.TrimSpace(target)
+			if host, portText, err := net.SplitHostPort(target); err == nil {
+				port, err := strconv.Atoi(portText)
+				if net.ParseIP(host) != nil && err == nil && port > 0 && port <= 65535 {
+					candidates = append(candidates, hostPort(host, port))
+				}
+				continue
+			}
+			rangeTargets = append(rangeTargets, target)
+		}
+		ranges := ParseIPRanges(rangeTargets)
 		s.logf("[DEBUG] parsed %d IP ranges\n", len(ranges))
 		if len(ranges) == 0 {
-			return []string{}, nil
+			return deduplicateEndpoints(candidates), nil
 		}
-
-		var candidates []string
+		skipped := 0
 		for _, r := range ranges {
-			start := ipToInt(r.Start)
-			end := ipToInt(r.End)
+			start, end, ok := rangeBounds(r)
+			if !ok {
+				// IPv6 and malformed ranges cannot be walked as IPv4; scanning
+				// whatever ipToInt made of them would probe unrelated hosts.
+				skipped++
+				continue
+			}
+			if span := end - start + 1; span > maxProxyIPsPerRange {
+				s.logf("[DEBUG] direct discovery: capping range %v-%v at %d IPs\n", r.Start, r.End, maxProxyIPsPerRange)
+				end = start + maxProxyIPsPerRange - 1
+			}
 			for current := start; current <= end; current++ {
-				ip := intToIP(current).String()
+				ip := ipv4String(current)
 				shuffledPorts := append([]int(nil), ports...)
 				if len(shuffledPorts) > 1 {
 					rand.Shuffle(len(shuffledPorts), func(i, j int) {
@@ -213,6 +241,9 @@ func (s *Scanner) collectProxyCandidates(rawTargets []string, ports []int, disco
 					candidates = append(candidates, hostPort(ip, port))
 				}
 			}
+		}
+		if skipped > 0 {
+			s.logf("[!] direct discovery skipped %d non-IPv4 target range(s)\n", skipped)
 		}
 		s.logf("[DEBUG] direct method generated %d candidates\n", len(candidates))
 		return deduplicateEndpoints(candidates), nil
@@ -256,7 +287,7 @@ func (s *Scanner) scanProxyCandidates(candidates []string, concurrency int, time
 	// For HTTP proxies, use optimized 3-wave pipeline
 	if _, isHTTP := verifier.(httpVerifier); isHTTP && !liteMode {
 		s.logf("[TRACE] scanProxyCandidates: Using 3-wave HTTP proxy pipeline for %d candidates\n", total)
-		return s.scanProxyCandidatesWave3(candidates, timeout, transferModel)
+		return s.scanProxyCandidatesWave3(candidates, concurrency, timeout, transferModel)
 	}
 
 	// Lite HTTP and SOCKS5 use bounded worker verification.
@@ -333,7 +364,7 @@ func (s *Scanner) scanProxyCandidates(candidates []string, concurrency int, time
 // scanProxyCandidatesWave3 implements a per-candidate 3-wave pipeline.
 // Each candidate flows W1->W2->W3 independently (like Python), so slow W3
 // candidates do not block W1/W2 throughput for the rest of the set.
-func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.Duration, transferModel string) []ProxyScanResult {
+func (s *Scanner) scanProxyCandidatesWave3(candidates []string, concurrency int, maxTimeout time.Duration, transferModel string) []ProxyScanResult {
 	total := len(candidates)
 	s.logf("[TRACE] Pipelined Wave3 starting: total=%d candidates (w1=%d w2=%d w3=%d)\n", total, httpWave1Concurrency, httpWave2Concurrency, httpWave3Concurrency)
 	w1Timeout, w2Timeout, w3Timeout := waveTimeouts(maxTimeout)
@@ -352,18 +383,13 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.
 		return b
 	}
 
-	sem1 := make(chan struct{}, minInt(httpWave1Concurrency, total))
-	sem2 := make(chan struct{}, minInt(httpWave2Concurrency, total))
-	sem3 := make(chan struct{}, minInt(httpWave3Concurrency, total))
+	concurrency = max(1, min(concurrency, total))
+	sem1 := make(chan struct{}, minInt(httpWave1Concurrency, concurrency))
+	sem2 := make(chan struct{}, minInt(httpWave2Concurrency, concurrency))
+	sem3 := make(chan struct{}, minInt(httpWave3Concurrency, concurrency))
 
 	// Match Python's bounded task-object strategy to avoid goroutine explosion.
-	taskCap := httpWave1Concurrency * 4
-	if taskCap < 8192 {
-		taskCap = 8192
-	}
-	if taskCap > total {
-		taskCap = total
-	}
+	taskCap := concurrency
 	taskSlots := make(chan struct{}, taskCap)
 
 	var (
@@ -371,12 +397,14 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.
 		mu       sync.Mutex
 		wg       sync.WaitGroup
 
-		w1Done atomic.Int64
-		w1Pass atomic.Int64
-		w2Done atomic.Int64
-		w2Pass atomic.Int64
-		w3Done atomic.Int64
-		w3Pass atomic.Int64
+		completed atomic.Int64
+		reportMu  sync.Mutex
+		w1Done    atomic.Int64
+		w1Pass    atomic.Int64
+		w2Done    atomic.Int64
+		w2Pass    atomic.Int64
+		w3Done    atomic.Int64
+		w3Pass    atomic.Int64
 	)
 
 	tickEvery := total / 400
@@ -384,7 +412,10 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.
 		tickEvery = 1
 	}
 
-	report := func(done int64) {
+	report := func() {
+		reportMu.Lock()
+		defer reportMu.Unlock()
+		done := completed.Add(1)
 		if done%int64(tickEvery) != 0 && done != int64(total) {
 			return
 		}
@@ -405,6 +436,7 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.
 		go func(ep string) {
 			defer wg.Done()
 			defer func() { <-taskSlots }()
+			defer report()
 			if !s.waitWhilePaused() {
 				w1Done.Add(1)
 				return
@@ -420,11 +452,10 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.
 			}
 			ok := httpWave1(ep, w1Timeout)
 			<-sem1
-			done := w1Done.Add(1)
+			w1Done.Add(1)
 			if ok {
 				w1Pass.Add(1)
 			} else {
-				report(done)
 				return
 			}
 
@@ -440,7 +471,6 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.
 			if ok {
 				w2Pass.Add(1)
 			} else {
-				report(done)
 				return
 			}
 
@@ -476,7 +506,6 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, maxTimeout time.
 				mu.Unlock()
 			}
 
-			report(done)
 		}(endpoint)
 	}
 
@@ -684,16 +713,7 @@ func probeHTTPProxyHost(endpoint, host string, timeout time.Duration) bool {
 		return false
 	}
 
-	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
-	if n <= 0 && err != io.EOF {
-		return false
-	}
-	if n > 0 {
-		head := strings.ToLower(string(buf[:n]))
-		return strings.Contains(head, "http/") || strings.Contains(head, host)
-	}
-	return true
+	return readProxyHTTPResponse(conn, false, true)
 }
 
 func probeSOCKS5ProxyHost(endpoint, host string, timeout time.Duration) bool {
@@ -727,31 +747,7 @@ func probeSOCKS5ProxyHost(endpoint, host string, timeout time.Duration) bool {
 		return false
 	}
 
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return false
-	}
-	if header[1] != 0x00 {
-		return false
-	}
-	switch header[3] {
-	case 0x01:
-		if _, err := io.CopyN(io.Discard, conn, 6); err != nil {
-			return false
-		}
-	case 0x03:
-		lenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return false
-		}
-		if _, err := io.CopyN(io.Discard, conn, int64(lenBuf[0])+2); err != nil {
-			return false
-		}
-	case 0x04:
-		if _, err := io.CopyN(io.Discard, conn, 18); err != nil {
-			return false
-		}
-	default:
+	if !readSOCKS5Reply(conn) {
 		return false
 	}
 
@@ -759,16 +755,7 @@ func probeSOCKS5ProxyHost(endpoint, host string, timeout time.Duration) bool {
 	if _, err := io.WriteString(conn, reqLine); err != nil {
 		return false
 	}
-	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
-	if n <= 0 && err != io.EOF {
-		return false
-	}
-	if n > 0 {
-		head := strings.ToLower(string(buf[:n]))
-		return strings.Contains(head, "http/") || strings.Contains(head, host)
-	}
-	return true
+	return readProxyHTTPResponse(conn, false, true)
 }
 
 func (httpVerifier) verify(endpoint string, timeout time.Duration) bool {
@@ -811,13 +798,7 @@ func httpWave2(endpoint string, timeout time.Duration) bool {
 		return false
 	}
 
-	head := make([]byte, 128)
-	n, err := conn.Read(head)
-	if n <= 0 || err != nil && err != io.EOF {
-		return false
-	}
-	head = head[:n]
-	return bytesHasHTTP200Prefix(head)
+	return readProxyHTTPResponse(conn, false, false)
 }
 
 func httpWave3(endpoint string, timeout time.Duration) bool {
@@ -836,39 +817,50 @@ func httpWave3(endpoint string, timeout time.Duration) bool {
 		return false
 	}
 
-	buf := make([]byte, 0, httpWave3Limit)
-	tmp := make([]byte, 1024)
-	deadline := time.Now().Add(timeout)
-	for len(buf) < cap(buf) {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(remaining))
-		n, readErr := conn.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if bytes.Contains(buf, exampleDomainSig) {
-				break
-			}
-		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
-			if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
-				break
-			}
-			return false
-		}
-	}
-
-	return bytesHasHTTP200Prefix(buf) && bytes.Contains(buf, exampleDomainSig)
+	return readProxyHTTPResponse(conn, true, false)
 }
 
-func bytesHasHTTP200Prefix(data []byte) bool {
-	line := bytes.TrimSpace(data)
-	return bytes.HasPrefix(line, httpStatusPrefix11) || bytes.HasPrefix(line, httpStatusPrefix10)
+// Bound untrusted headers and body, and let net/http handle TCP fragmentation
+// and chunked transfer encoding. A fingerprint in a header is not a body match.
+func readProxyHTTPResponse(reader io.Reader, fingerprint, allowRedirect bool) bool {
+	response, err := http.ReadResponse(bufio.NewReader(io.LimitReader(reader, httpWave3Limit)), nil)
+	if err != nil {
+		return false
+	}
+	// The caller owns and closes the raw connection. Closing this parsed body
+	// would drain it and delay a header-only probe until EOF or timeout.
+	if response.StatusCode != http.StatusOK && !(allowRedirect && response.StatusCode >= 200 && response.StatusCode < 400) {
+		return false
+	}
+	if !fingerprint {
+		return true
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, httpWave3Limit))
+	return err == nil && bytes.Contains(body, exampleDomainSig)
+}
+
+func readSOCKS5Reply(reader io.Reader) bool {
+	var header [4]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil || header[0] != 5 || header[1] != 0 || header[2] != 0 {
+		return false
+	}
+	var size int64
+	switch header[3] {
+	case 1:
+		size = 6
+	case 4:
+		size = 18
+	case 3:
+		var length [1]byte
+		if _, err := io.ReadFull(reader, length[:]); err != nil || length[0] == 0 {
+			return false
+		}
+		size = int64(length[0]) + 2
+	default:
+		return false
+	}
+	_, err := io.CopyN(io.Discard, reader, size)
+	return err == nil
 }
 
 func (socks5Verifier) verify(endpoint string, timeout time.Duration) bool {
@@ -896,11 +888,7 @@ func (socks5Verifier) verify(endpoint string, timeout time.Duration) bool {
 		return false
 	}
 
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		return false
-	}
-	if reply[0] != 0x05 || reply[1] != 0x00 {
+	if !readSOCKS5Reply(conn) {
 		return false
 	}
 
@@ -908,9 +896,5 @@ func (socks5Verifier) verify(endpoint string, timeout time.Duration) bool {
 		return false
 	}
 
-	probe := make([]byte, 4)
-	if _, err := io.ReadFull(conn, probe); err != nil {
-		return false
-	}
-	return strings.HasPrefix(string(probe), "HTTP/")
+	return readProxyHTTPResponse(conn, false, true)
 }

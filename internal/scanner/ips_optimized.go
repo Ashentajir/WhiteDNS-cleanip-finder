@@ -81,6 +81,9 @@ func (s *Scanner) runThreeWavePipelineOptimized(ctx context.Context, endpoints [
 	var deadCount int32
 	useDeadCull := total >= 100
 	deadThreshold := 10
+	if opts.FastMode {
+		deadThreshold = 3
+	}
 	if !useDeadCull {
 		deadThreshold = total
 	}

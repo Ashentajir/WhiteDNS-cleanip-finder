@@ -35,6 +35,7 @@ sealed class Screen {
     object Home : Screen()
     data class Config(val kind: ScanKind) : Screen()
     object AsnPicker : Screen()
+    object EdgePicker : Screen()
     object ConfigMaker : Screen()
     data class Scanning(val kind: ScanKind) : Screen()
     object Results : Screen()
@@ -206,6 +207,7 @@ class MainActivity : ComponentActivity() {
                     Screen.Home -> ""   // banner inside HomeScreen shows branding
                     is Screen.Config -> "${(screen as Screen.Config).kind.label()} · Config"
                     Screen.AsnPicker -> "Select ASNs"
+                    Screen.EdgePicker -> "Edge networks"
                     Screen.ConfigMaker -> "Config Maker"
                     is Screen.Scanning -> "${(screen as Screen.Scanning).kind.label()} · Scanning"
                     Screen.Results -> "Results"
@@ -223,6 +225,7 @@ class MainActivity : ComponentActivity() {
                             screen = Screen.Home
                         }
                         Screen.AsnPicker -> screen = Screen.Config(pendingKind)
+                        Screen.EdgePicker -> screen = Screen.Config(pendingKind)
                         else -> screen = Screen.Home
                     }
                 }
@@ -262,6 +265,12 @@ class MainActivity : ComponentActivity() {
                                     screen = if (kind == ScanKind.ASN_EXPORT) Screen.AsnPicker
                                              else Screen.Config(kind)
                                 },
+                                onEdgeFinder = {
+                                    vm.reset()
+                                    form = defaultFormState()
+                                    pendingKind = ScanKind.IP
+                                    screen = Screen.EdgePicker
+                                },
                                 onConfigMaker = { screen = Screen.ConfigMaker },
                             )
 
@@ -274,6 +283,10 @@ class MainActivity : ComponentActivity() {
                                 onPickASN = {
                                     pendingKind = s.kind
                                     screen = Screen.AsnPicker
+                                },
+                                onPickEdge = {
+                                    pendingKind = s.kind
+                                    screen = Screen.EdgePicker
                                 },
                                 onStart = {
                                     // Build everything that can throw BEFORE navigating, and guard
@@ -325,6 +338,18 @@ class MainActivity : ComponentActivity() {
                                     screen = if (pendingKind == ScanKind.ASN_EXPORT) Screen.Home
                                              else Screen.Config(pendingKind)
                                 },
+                            )
+
+                            Screen.EdgePicker -> EdgePickerScreen(
+                                onSelected = { provider, probeDomains, targets ->
+                                    form = form.copy(
+                                        targets = targets,
+                                        edgeProvider = provider,
+                                        edgeProbeDomains = probeDomains,
+                                    )
+                                    screen = Screen.Config(pendingKind)
+                                },
+                                onCancel = { screen = Screen.Config(pendingKind) },
                             )
 
                             is Screen.Scanning -> ScanningScreen(
@@ -422,6 +447,8 @@ private fun FormState.toEngineConfig(constrainedDevice: Boolean = false): ScanCo
     cfg.concurrency   = effectiveConcurrency.toLong()
     cfg.lowBandwidth  = lowBandwidth || effectiveLiteMode
     cfg.transferModel = transferModel
+    cfg.edgeProvider  = edgeProvider.trim()
+    cfg.setFastMode(fastMode && !lowBandwidth && !effectiveLiteMode)
     cfg.setSNIDomains(sniDomains.trim())
     cfg.setSNIStrict(sniStrict)
     cfg.setVerboseLog(verboseLog)

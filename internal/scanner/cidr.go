@@ -105,9 +105,29 @@ func calculateIPRange(start, end net.IP) int64 {
 	return endInt - startInt + 1
 }
 
-// ipToInt converts IPv4 to uint32
+// ipToInt converts an IPv4 address to its integer form, or -1 when the address
+// is not IPv4. net.ParseIP returns a 16-byte address even for "1.2.3.4", so the
+// four bytes have to be taken from To4() — reading ip[0:4] directly yields 0 for
+// a parsed IPv4 and an unrelated address for a real IPv6 one.
 func ipToInt(ip net.IP) int64 {
-	return int64(ip[0])<<24 | int64(ip[1])<<16 | int64(ip[2])<<8 | int64(ip[3])
+	v4 := ip.To4()
+	if v4 == nil {
+		return -1
+	}
+	return int64(v4[0])<<24 | int64(v4[1])<<16 | int64(v4[2])<<8 | int64(v4[3])
+}
+
+// rangeBounds returns the inclusive IPv4 bounds of r. ok is false for a range
+// that cannot be walked as IPv4 (an IPv6 target, or a reversed pair); callers
+// must skip it rather than iterate, since every address they would produce is
+// unrelated to what the user asked for.
+func rangeBounds(r IPRange) (start, end int64, ok bool) {
+	start = ipToInt(r.Start)
+	end = ipToInt(r.End)
+	if start < 0 || end < 0 || end < start {
+		return 0, 0, false
+	}
+	return start, end, true
 }
 
 // intToIP converts uint32 back to IPv4
@@ -115,72 +135,53 @@ func intToIP(val int64) net.IP {
 	return net.IPv4(byte((val>>24)&0xFF), byte((val>>16)&0xFF), byte((val>>8)&0xFF), byte(val&0xFF))
 }
 
-// StreamIPsFromRanges yields IPs from ranges without loading all at once
-// Calls handler for each batch
-func StreamIPsFromRanges(ranges []IPRange, batchSize int, handler func([]string) error) error {
-	var batch []string
-
-	for _, r := range ranges {
-		// For large ranges, iterate in chunks
-		if r.Size > int64(batchSize*10) {
-			if err := streamCIDRRange(r, batchSize, handler); err != nil {
-				return err
-			}
-		} else {
-			// For small ranges, accumulate into batch
-			batch = expandIPRange(r, batch, batchSize, handler)
-		}
-	}
-
-	// Handle remaining batch
-	if len(batch) > 0 {
-		if err := handler(batch); err != nil {
-			return err
-		}
-	}
-
-	return nil
+// ipv4String formats a numeric address without allocating a net.IP.
+func ipv4String(value int64) string {
+	var buf [15]byte
+	out := strconv.AppendUint(buf[:0], uint64(value>>24)&255, 10)
+	out = append(out, '.')
+	out = strconv.AppendUint(out, uint64(value>>16)&255, 10)
+	out = append(out, '.')
+	out = strconv.AppendUint(out, uint64(value>>8)&255, 10)
+	out = append(out, '.')
+	out = strconv.AppendUint(out, uint64(value)&255, 10)
+	return string(out)
 }
 
-// streamCIDRRange streams a large CIDR range in batches
-func streamCIDRRange(r IPRange, batchSize int, handler func([]string) error) error {
+// StreamIPsFromRanges streams IPv4 targets in input order. Each delivered
+// batch owns its backing array, so handlers may retain it.
+func StreamIPsFromRanges(ranges []IPRange, batchSize int, handler func([]string) error) error {
+	if batchSize <= 0 {
+		return fmt.Errorf("batch size must be positive")
+	}
 	var batch []string
-	start := ipToInt(r.Start)
-	end := ipToInt(r.End)
-
-	for current := start; current <= end; current++ {
-		batch = append(batch, intToIP(current).String())
-
-		if len(batch) >= batchSize {
-			if err := handler(batch); err != nil {
-				return err
+	for _, r := range ranges {
+		start, end, ok := rangeBounds(r)
+		if !ok {
+			continue
+		}
+		for current := start; current <= end; current++ {
+			if batch == nil {
+				// Avoid a large allocation for a single target.
+				capacity := batchSize
+				if remaining := end - current + 1; remaining < int64(capacity) {
+					capacity = int(remaining)
+				}
+				batch = make([]string, 0, capacity)
 			}
-			batch = []string{}
+			batch = append(batch, ipv4String(current))
+			if len(batch) == batchSize {
+				if err := handler(batch); err != nil {
+					return err
+				}
+				batch = nil
+			}
 		}
 	}
-
 	if len(batch) > 0 {
 		return handler(batch)
 	}
-
 	return nil
-}
-
-// expandIPRange expands small IP ranges into batch
-func expandIPRange(r IPRange, batch []string, batchSize int, handler func([]string) error) []string {
-	start := ipToInt(r.Start)
-	end := ipToInt(r.End)
-
-	for current := start; current <= end; current++ {
-		batch = append(batch, intToIP(current).String())
-
-		if len(batch) >= batchSize {
-			handler(batch)
-			batch = []string{}
-		}
-	}
-
-	return batch
 }
 
 // EstimateScanTime returns estimated scan time in seconds

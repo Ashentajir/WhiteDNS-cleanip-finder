@@ -34,6 +34,11 @@ type SpeedRankOptions struct {
 	LossSamples int
 	// Timeout bounds each individual network operation.
 	Timeout time.Duration
+	// MeasureWindow bounds how long a single throughput transfer is allowed to
+	// run. Throughput is computed from the bytes that actually moved inside the
+	// window, so a slow link reports its real speed instead of timing out with
+	// no number at all, and a fast link stops early once the payload is done.
+	MeasureWindow time.Duration
 	// SNI is the TLS server name / Host header used for the speed endpoint.
 	SNI string
 	// DownloadEndpoints are tried in order for the throughput/reachability
@@ -67,41 +72,42 @@ type SpeedEndpoint struct {
 	Reachability bool
 }
 
-// DefaultSpeedEndpoints returns the ordered fallback list. downloadBytes is
-// substituted into the Cloudflare endpoint. Only the Cloudflare entry is
-// PinToCandidate (dials the IP being ranked directly) since it is the anycast
-// network these clean-IP scans target; the others are real transfers against
-// well-known public test files but measure the box's general path, not the
-// candidate IP specifically. google-204 is a last-resort reachability check
-// only (0 bytes) — Google has no stable public bandwidth-test file.
-func DefaultSpeedEndpoints(downloadBytes int) []SpeedEndpoint {
-	return []SpeedEndpoint{
+// DefaultSpeedEndpoints returns the ordered endpoint list for ranking one
+// candidate IP. Every entry is PinToCandidate: the whole point is to compare
+// candidate IPs against each other, and an endpoint that resolves normally
+// measures the machine's own uplink instead — the same number for every
+// candidate, which flattens the ranking and burns the user's data doing it.
+// An IP that cannot serve a transfer has no throughput, and reporting that is
+// the correct answer.
+//
+// sni is the TLS name presented to the candidate; the second endpoint asks it
+// for its own root document, which is the only throughput measurement available
+// on an edge that is not Cloudflare.
+func DefaultSpeedEndpoints(downloadBytes int, sni string) []SpeedEndpoint {
+	if strings.TrimSpace(sni) == "" {
+		sni = "speed.cloudflare.com"
+	}
+	eps := []SpeedEndpoint{
 		{
 			Name:           "cloudflare",
 			URL:            fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", downloadBytes),
 			Host:           "speed.cloudflare.com",
 			PinToCandidate: true,
 		},
-		{
-			Name: "cachefly",
-			URL:  "https://cachefly.cachefly.net/10mb.test",
-		},
-		{
-			Name: "hetzner",
-			URL:  "https://speed.hetzner.de/100MB.bin",
-		},
-		{
-			Name:         "google-204",
-			URL:          "https://www.google.com/generate_204",
-			Reachability: true,
-		},
 	}
+	if sni != "speed.cloudflare.com" {
+		eps = append(eps, SpeedEndpoint{
+			Name:           "edge-root",
+			URL:            "https://" + sni + "/",
+			Host:           sni,
+			PinToCandidate: true,
+		})
+	}
+	return eps
 }
 
-// DefaultUploadEndpoints returns the ordered upload fallback list. Only
-// Cloudflare is PinToCandidate — postman-echo and httpbin are well-known
-// public API-testing echo endpoints that don't persist the uploaded body,
-// but measure the box's general upload path, not the candidate IP.
+// DefaultUploadEndpoints returns the upload endpoint list. As with downloads,
+// only a transfer pinned to the candidate IP says anything about that IP.
 func DefaultUploadEndpoints() []SpeedEndpoint {
 	return []SpeedEndpoint{
 		{
@@ -109,14 +115,6 @@ func DefaultUploadEndpoints() []SpeedEndpoint {
 			URL:            "https://speed.cloudflare.com/__up",
 			Host:           "speed.cloudflare.com",
 			PinToCandidate: true,
-		},
-		{
-			Name: "postman-echo",
-			URL:  "https://postman-echo.com/post",
-		},
-		{
-			Name: "httpbin",
-			URL:  "https://httpbin.org/post",
 		},
 	}
 }
@@ -140,11 +138,14 @@ func (o *SpeedRankOptions) applyDefaults() {
 	if o.Timeout <= 0 {
 		o.Timeout = 12 * time.Second
 	}
+	if o.MeasureWindow <= 0 {
+		o.MeasureWindow = 4 * time.Second
+	}
 	if strings.TrimSpace(o.SNI) == "" {
 		o.SNI = "speed.cloudflare.com"
 	}
 	if len(o.DownloadEndpoints) == 0 {
-		o.DownloadEndpoints = DefaultSpeedEndpoints(o.DownloadBytes)
+		o.DownloadEndpoints = DefaultSpeedEndpoints(o.DownloadBytes, o.SNI)
 	}
 	if len(o.UploadEndpoints) == 0 {
 		o.UploadEndpoints = DefaultUploadEndpoints()
@@ -319,7 +320,9 @@ func benchmarkOneIP(ctx context.Context, ip string, opts SpeedRankOptions) Speed
 			break
 		}
 	}
-	if !gotThroughput && res.Source == "" && lastErr != "" {
+	if !gotThroughput && lastErr != "" {
+		// Reachable but nothing would transfer: say so, instead of leaving a
+		// silent 0 Mbps that looks like a measurement.
 		res.Error = "download: " + lastErr
 	}
 
@@ -396,7 +399,9 @@ func measureEndpoint(ctx context.Context, candidateAddr string, ep SpeedEndpoint
 	client := endpointHTTPClient(candidateAddr, host, ep.PinToCandidate, opts)
 	defer client.CloseIdleConnections()
 
-	reqCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	// Connect/headers get Timeout; the body gets the measurement window on top,
+	// so a slow link produces a real number instead of a timeout error.
+	reqCtx, cancel := context.WithTimeout(ctx, opts.Timeout+opts.MeasureWindow)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, ep.URL, nil)
 	if err != nil {
@@ -407,7 +412,6 @@ func measureEndpoint(ctx context.Context, candidateAddr string, ep SpeedEndpoint
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
-	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -416,15 +420,46 @@ func measureEndpoint(ctx context.Context, candidateAddr string, ep SpeedEndpoint
 	if resp.StatusCode >= 400 {
 		return 0, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	n, copyErr := io.Copy(io.Discard, resp.Body)
-	elapsed := time.Since(start).Seconds()
 	if ep.Reachability {
 		return 0, nil
 	}
-	if copyErr != nil && n == 0 {
-		return 0, copyErr
+
+	// Time the body only: connect and TTFB are already reported as latency, and
+	// folding them in here would understate throughput on a distant edge.
+	start := time.Now()
+	n, copyErr := copyForWindow(resp.Body, opts.MeasureWindow)
+	elapsed := time.Since(start).Seconds()
+	if n == 0 {
+		if copyErr != nil {
+			return 0, copyErr
+		}
+		return 0, fmt.Errorf("empty body")
 	}
 	return mbps(n, elapsed), nil
+}
+
+// copyForWindow drains r for at most window, returning how many bytes moved.
+// A transfer cut short by the window is a successful measurement, not an error.
+func copyForWindow(r io.Reader, window time.Duration) (int64, error) {
+	if window <= 0 {
+		return io.Copy(io.Discard, r)
+	}
+	deadline := time.Now().Add(window)
+	buf := make([]byte, 64*1024)
+	var total int64
+	for {
+		n, err := r.Read(buf)
+		total += int64(n)
+		if err != nil {
+			if err == io.EOF {
+				return total, nil
+			}
+			return total, err
+		}
+		if !time.Now().Before(deadline) {
+			return total, nil
+		}
+	}
 }
 
 // hostFromURL extracts the host (without port) from an https URL.
@@ -446,8 +481,8 @@ func measureUpload(ctx context.Context, candidateAddr string, opts SpeedRankOpti
 			host = hostFromURL(ep.URL)
 		}
 		client := endpointHTTPClient(candidateAddr, host, ep.PinToCandidate, opts)
-		reqCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
-		body := &countingReader{remaining: opts.UploadBytes}
+		reqCtx, cancel := context.WithTimeout(ctx, opts.Timeout+opts.MeasureWindow)
+		body := &countingReader{remaining: opts.UploadBytes, deadline: time.Now().Add(opts.MeasureWindow)}
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, ep.URL, body)
 		if err != nil {
 			cancel()
@@ -458,7 +493,8 @@ func measureUpload(ctx context.Context, candidateAddr string, opts SpeedRankOpti
 		if host != "" {
 			req.Host = host
 		}
-		req.ContentLength = int64(opts.UploadBytes)
+		// No ContentLength: the body stops at the measurement window, so the size
+		// is not known up front and the request goes out chunked.
 		req.Header.Set("User-Agent", "Mozilla/5.0")
 		req.Header.Set("Content-Type", "application/octet-stream")
 
@@ -487,14 +523,19 @@ func measureUpload(ctx context.Context, candidateAddr string, opts SpeedRankOpti
 	return 0, "", lastErr
 }
 
-// countingReader streams a fixed number of zero bytes and tracks how many
-// remain, so partial uploads can still be measured.
+// countingReader streams zero bytes until either the requested size is sent or
+// the measurement window closes, tracking the remainder so a partial upload is
+// still a usable measurement.
 type countingReader struct {
 	remaining int
+	deadline  time.Time
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
 	if c.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if !c.deadline.IsZero() && !time.Now().Before(c.deadline) {
 		return 0, io.EOF
 	}
 	n := len(p)

@@ -22,7 +22,7 @@ import androidx.compose.ui.unit.sp
 import com.whitescan.app.ScanKind
 
 @Composable
-fun HomeScreen(onSelect: (ScanKind) -> Unit, onConfigMaker: () -> Unit) {
+fun HomeScreen(onSelect: (ScanKind) -> Unit, onEdgeFinder: () -> Unit, onConfigMaker: () -> Unit) {
     val uriHandler = LocalUriHandler.current
     BoxWithConstraints(
         modifier = Modifier
@@ -91,6 +91,13 @@ fun HomeScreen(onSelect: (ScanKind) -> Unit, onConfigMaker: () -> Unit) {
             subtitle = "Direct probe of IP ranges on specified ports",
             accentColor = CyanAccent,
             onClick = { onSelect(ScanKind.IP) },
+        )
+        ScanCard(
+            icon = Icons.Default.CloudQueue,
+            title = "Edge IP Finder",
+            subtitle = "Clean IPs for Cloudflare, Vercel, Fly.io, Render, Netlify, Railway, Koyeb, Glitch",
+            accentColor = Amber,
+            onClick = onEdgeFinder,
         )
         ScanCard(
             icon = Icons.Default.Lock,

@@ -102,7 +102,7 @@ func renderMenuTitle(width int, logs int) string {
 	meta := sDim.Render(fmt.Sprintf("logs:%d  %s", logs, time.Now().Format("15:04:05")))
 
 	if width < 72 {
-		line := renderGradientText("WHITEDNS v1.4.0", brandColors, true)
+		line := renderGradientText("WHITEDNS v1.4.1", brandColors, true)
 		credit := renderGradientText("developed by TAjirax", devColors, false)
 		return lipgloss.PlaceHorizontal(width, lipgloss.Center, line) + "\n" +
 			lipgloss.PlaceHorizontal(width, lipgloss.Center, credit) + "\n" +
@@ -131,7 +131,7 @@ func renderMenuTitle(width int, logs int) string {
 		out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, renderGradientText(line, brandColors, true)))
 		out.WriteString("\n")
 	}
-	tagline := renderGradientText("v1.4.0  -  developed by TAjirax", devColors, true)
+	tagline := renderGradientText("v1.4.1  -  developed by TAjirax", devColors, true)
 	out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, tagline))
 	out.WriteString("\n")
 	out.WriteString(lipgloss.PlaceHorizontal(width, lipgloss.Center, meta))
@@ -170,6 +170,14 @@ type actionCompleteMsg struct {
 	err   error
 }
 type errorMsg struct{ text string }
+
+// edgeMinedMsg carries the result of resolving an edge provider's seed hosts.
+type edgeMinedMsg struct {
+	provider string
+	resolved int
+	targets  []string
+	err      error
+}
 type logMsg struct{ text string }
 
 // ------------------------------------------------------------
@@ -199,6 +207,8 @@ const (
 	screenScanResults       = "scan_results"
 	screenSNISource         = "sni_source"
 	screenSNIMode           = "sni_mode"
+	screenEdgeProvider      = "edge_provider"
+	screenIPMode            = "ip_scan_mode"
 )
 
 const maxAllowedConcurrency = 10000
@@ -244,6 +254,14 @@ type scanConfig struct {
 	// SNIStrict requires the TLS handshake to accept the presented SNI before a
 	// pair is counted (for domain-fronting / SNI-spoofing discovery).
 	SNIStrict bool
+	// FastMode stops probing an endpoint once enough domains have confirmed it,
+	// drops retries and timeout padding, and culls unresponsive IPs sooner. Same
+	// verdict, less work per endpoint.
+	FastMode bool
+	// EdgeProvider names the config.EdgeProvider whose edge IPs are being
+	// scanned (empty for the plain ASN/paste/file target modes). It scopes the
+	// probe hostnames to that platform so a hit means the IP really serves it.
+	EdgeProvider string
 }
 
 type menuItem struct {
@@ -438,6 +456,10 @@ type tuiModel struct {
 	e2eDomain    string
 	e2ePubKey    string
 	e2eTransport string
+
+	// edgeMining is true while an edge provider's seed hostnames are being
+	// resolved in the background.
+	edgeMining bool
 }
 
 // ------------------------------------------------------------
@@ -455,22 +477,23 @@ func NewTUI(a *App) *tuiModel {
 
 	menu := []menuItem{
 		{key: "1", label: "Scan IPs", action: "scan_ips"},
-		{key: "2", label: "Scan HTTP Proxies", action: "scan"},
-		{key: "3", label: "Scan SOCKS5 Proxies", action: "scan_socks5"},
-		{key: "4", label: "SNI Scanner (TLS Hostname Probe)", action: "sni_scanner"},
-		{key: "5", label: "DNS Resolver / Tunnel Scan", action: "dns_scan"},
-		{key: "6", label: "Speed & Loss Rank (Cloudflare)", action: "speed_rank"},
-		{key: "7", label: "Reload IP Pool", action: "reload_pool"},
-		{key: "8", label: "Manage IP Pool", action: "manage_pool"},
-		{key: "9", label: "Inspect IPs (ASN)", action: "inspect_ip"},
-		{key: "10", label: "Export ASN IPs", action: "export_asn"},
-		{key: "11", label: "Autotune Scan Rates", action: "autotune"},
-		{key: "12", label: "Desync Scanner", action: "desync_scanner"},
-		{key: "13", label: "Manage SNI Probe Domains", action: "manage_tls_probe"},
-		{key: "14", label: "Settings: Probe Heuristics", action: "toggle_probe_flags"},
-		{key: "15", label: "Config Maker", action: "config_maker"},
-		{key: "16", label: "Configure Desync", action: "configure_desync"},
-		{key: "17", label: "Clear Cache", action: "clear_cache"},
+		{key: "2", label: "Edge Provider IP Finder", action: "edge_finder"},
+		{key: "3", label: "Scan HTTP Proxies", action: "scan"},
+		{key: "4", label: "Scan SOCKS5 Proxies", action: "scan_socks5"},
+		{key: "5", label: "SNI Scanner (TLS Hostname Probe)", action: "sni_scanner"},
+		{key: "6", label: "DNS Resolver / Tunnel Scan", action: "dns_scan"},
+		{key: "7", label: "Speed & Loss Rank (Cloudflare)", action: "speed_rank"},
+		{key: "8", label: "Reload IP Pool", action: "reload_pool"},
+		{key: "9", label: "Manage IP Pool", action: "manage_pool"},
+		{key: "10", label: "Inspect IPs (ASN)", action: "inspect_ip"},
+		{key: "11", label: "Export ASN IPs", action: "export_asn"},
+		{key: "12", label: "Autotune Scan Rates", action: "autotune"},
+		{key: "13", label: "Desync Scanner", action: "desync_scanner"},
+		{key: "14", label: "Manage SNI Probe Domains", action: "manage_tls_probe"},
+		{key: "15", label: "Settings: Probe Heuristics", action: "toggle_probe_flags"},
+		{key: "16", label: "Config Maker", action: "config_maker"},
+		{key: "17", label: "Configure Desync", action: "configure_desync"},
+		{key: "18", label: "Clear Cache", action: "clear_cache"},
 		{key: "0", label: "Exit", action: "exit"},
 	}
 
@@ -820,6 +843,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handlePoolOperationComplete(v)
 	case actionCompleteMsg:
 		return m.handleActionComplete(v)
+	case edgeMinedMsg:
+		return m.handleEdgeMined(v)
 	case errorMsg:
 		m.setToast(sError.Render("x "+v.text), 5*time.Second)
 		return m, nil
@@ -852,6 +877,10 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m, screenCmd = m.handleSNISourceScreen(msg)
 	case screenSNIMode:
 		m, screenCmd = m.handleSNIModeScreen(msg)
+	case screenEdgeProvider:
+		m, screenCmd = m.handleEdgeProviderScreen(msg)
+	case screenIPMode:
+		m, screenCmd = m.handleIPModeScreen(msg)
 	case screenASNFamily:
 		m, screenCmd = m.handleASNFamilyScreen(msg)
 	case screenSelectASN:
@@ -933,6 +962,10 @@ func (m tuiModel) View() string {
 		body = m.viewSNISource(w, h)
 	case screenSNIMode:
 		body = m.viewSNIMode(w, h)
+	case screenEdgeProvider:
+		body = m.viewEdgeProvider(w, h)
+	case screenIPMode:
+		body = m.viewIPMode(w, h)
 	case screenASNFamily:
 		body = m.viewASNFamily(w, h)
 	case screenSelectASN:
@@ -1153,6 +1186,7 @@ func (m tuiModel) viewScanMode(w, h int) string {
 		"[paste] 📋 Paste targets (IPs/CIDRs)",
 		"[type] ⌨️ Type targets manually",
 		"[file] 📄 Import targets from .txt file",
+		"[edge] 🌐 Edge provider (Cloudflare / Vercel / Fly.io / …)",
 	}
 	return m.viewList(w, h,
 		fmt.Sprintf("SCAN MODE - %s", label),
@@ -2047,6 +2081,13 @@ func (m tuiModel) activateMenuItem() (tuiModel, tea.Cmd) {
 		m.gotoScanMode("dns_scan", "dns")
 	case "scan_ips":
 		m.gotoScanMode("scan_ips", "ipscan")
+	case "edge_finder":
+		// Straight to the platform picker: the targets come from the provider,
+		// so the ASN/paste/file source step has nothing to ask.
+		m.gotoScanMode("scan_ips", "ipscan")
+		m.screen = screenEdgeProvider
+		m.cursor = 0
+		m.addLog("Edge Provider IP Finder opened")
 	case "speed_rank":
 		m.addLog("Speed & Loss Rank selected (Cloudflare benchmark)")
 		m.gotoScanMode("speed_rank", "speedrank")
@@ -2124,10 +2165,11 @@ func (m tuiModel) handleScanModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 			m.cursor--
 		}
 	case "down", "j":
-		if m.cursor < 3 {
+		if m.cursor < 4 {
 			m.cursor++
 		}
 	case "enter":
+		m.scanConfig.EdgeProvider = ""
 		switch m.cursor {
 		case 0:
 			m.scanConfig.Mode = "asn"
@@ -2144,9 +2186,127 @@ func (m tuiModel) handleScanModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 			m.scanConfig.Mode = "file"
 			m.pushScreen(screenTypeTargets)
 			m.setupInput("Path to .txt file with IPs/CIDRs (one per line)")
+		case 4:
+			m.scanConfig.Mode = "edge"
+			m.pushScreen(screenEdgeProvider)
 		}
 	}
 	return m, nil
+}
+
+// handleIPModeScreen chooses how hard the IP scan works per endpoint.
+func (m tuiModel) handleIPModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < 1 {
+			m.cursor++
+		}
+	case "enter":
+		m.scanConfig.FastMode = m.cursor == 1
+		if m.scanConfig.FastMode {
+			m.addLog("Scan mode: fast (stops each endpoint once its verdict is settled)")
+		} else {
+			m.addLog("Scan mode: balanced (every probe domain tested)")
+		}
+		m.pushScreen(screenSelectConcurrency)
+	}
+	return m, nil
+}
+
+func (m tuiModel) viewIPMode(w, h int) string {
+	items := []string{
+		"Balanced - test every probe domain, retry flaky ones",
+		"Fast - stop each endpoint as soon as its verdict is settled",
+	}
+	help := "↑↓ navigate  ·  Enter select  ·  Esc back"
+	if m.cursor == 1 {
+		help = "Same accepted IPs, fewer probes each  ·  avoid on slow or lossy links"
+	}
+	return m.viewList(w, h, "SCAN MODE", items, help)
+}
+
+// handleEdgeProviderScreen picks the CDN / PaaS edge whose IPs to scan, then
+// resolves that platform seed hostnames in the background.
+func (m tuiModel) handleEdgeProviderScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok || m.edgeMining {
+		return m, nil
+	}
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < len(config.EdgeProviders)-1 {
+			m.cursor++
+		}
+	case "enter":
+		p := config.EdgeProviders[m.cursor]
+		m.scanConfig.EdgeProvider = p.Name
+		m.edgeMining = true
+		m.addLog(fmt.Sprintf("Edge provider: %s (resolving %d seed host(s))", p.Name, len(p.Hosts)))
+		return m, cmdMineEdgeProvider(p)
+	}
+	return m, nil
+}
+
+// handleEdgeMined turns the resolved edge IPs into scan targets and hands them
+// to the normal review -> ports -> scan flow.
+func (m tuiModel) handleEdgeMined(msg edgeMinedMsg) (tuiModel, tea.Cmd) {
+	m.edgeMining = false
+	if m.screen != screenEdgeProvider {
+		// User navigated away while the lookups were in flight; drop the result
+		// instead of hijacking whatever screen they are on now.
+		m.scanConfig.EdgeProvider = ""
+		return m, nil
+	}
+	if msg.err != nil {
+		m.scanConfig.EdgeProvider = ""
+		m.addLog(fmt.Sprintf("Edge provider %s failed: %v", msg.provider, msg.err))
+		m.setToast(sError.Render("x "+msg.err.Error()), 5*time.Second)
+		return m, nil
+	}
+	stats := scanner.ParseTargetsFromPaste(strings.Join(msg.targets, " "))
+	m.parsedTargetStats = &stats
+	m.parsedTargetsScroll = 0
+	m.scanConfig.Targets = stats.Valid
+	m.scanConfig.ASNs = nil
+	m.addLog(fmt.Sprintf("%s: %d edge IP(s) resolved -> %d target range(s)", msg.provider, msg.resolved, len(stats.Valid)))
+	m.pushScreen(screenReviewTargets)
+	return m, nil
+}
+
+// cmdMineEdgeProvider resolves the provider hostnames off the UI thread.
+func cmdMineEdgeProvider(p config.EdgeProvider) tea.Cmd {
+	return func() tea.Msg {
+		ips := mineProviderIPs(p)
+		targets := p.Targets(ips)
+		if len(targets) == 0 {
+			return edgeMinedMsg{provider: p.Name, err: fmt.Errorf("no edge IPs resolved (check DNS)")}
+		}
+		return edgeMinedMsg{provider: p.Name, resolved: len(ips), targets: targets}
+	}
+}
+
+func (m tuiModel) viewEdgeProvider(w, h int) string {
+	items := make([]string, 0, len(config.EdgeProviders))
+	for _, p := range config.EdgeProviders {
+		items = append(items, fmt.Sprintf("%s  ·  %d host(s), %d published range(s)", p.Name, len(p.Hosts), len(p.CIDRs)))
+	}
+	help := "↑↓ navigate  ·  Enter select  ·  Esc back"
+	if m.edgeMining {
+		help = "Resolving edge hostnames…"
+	}
+	return m.viewList(w, h, "EDGE PROVIDER - PICK A PLATFORM TO SCAN", items, help)
 }
 
 // handleSNISourceScreen lets the user choose the SNI hostnames probed by the
@@ -2220,7 +2380,7 @@ func (m tuiModel) handleSNIModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 	case "enter":
 		m.scanConfig.SNIStrict = m.cursor == 0
 		if m.scanConfig.SNIStrict {
-			m.addLog("SNI mode: strict (SNI must be accepted; cert match reported)")
+			m.addLog("SNI mode: strict (keeps only pairs whose cert covers the SNI)")
 		} else {
 			m.addLog("SNI mode: lenient (any TLS handshake counts)")
 		}
@@ -2232,8 +2392,8 @@ func (m tuiModel) handleSNIModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 
 func (m tuiModel) viewSNIMode(w, h int) string {
 	items := []string{
-		"Strict - SNI must be accepted (domain fronting / spoof)",
-		"Lenient - any TLS handshake counts (reachability)",
+		"Strict - edge must answer that hostname with a cert for it (spoofable)",
+		"Lenient - any TLS handshake counts (reachability only)",
 	}
 	return m.viewList(w, h, "SNI MATCH MODE", items, "↑↓ navigate  ·  Enter select  ·  Esc back")
 }
@@ -2629,7 +2789,9 @@ func (m tuiModel) handleSelectPortsScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 			m.scanConfig.PortsString = preset.ports
 			m.scanConfig.Ports = parsePorts(m.scanConfig.PortsString)
 		}
-		if m.operationType == "scan_ips" || m.operationType == "sni_scanner" || m.operationType == "desync_scanner" {
+		if m.operationType == "scan_ips" {
+			m.pushScreen(screenIPMode)
+		} else if m.operationType == "sni_scanner" || m.operationType == "desync_scanner" {
 			m.pushScreen(screenSelectConcurrency)
 			m.cursor = 1
 		} else {
@@ -3283,15 +3445,26 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 					EndpointCount:             endpointCount,
 					LowBandwidth:              cfg.LowBandwidth,
 					AdaptiveDomainConcurrency: cfg.AdaptiveDomainConcurrency,
+					FastMode:                  cfg.FastMode && !cfg.LowBandwidth,
 				}
 				if cfg.LowBandwidth {
 					opts.AdaptiveDomainConcurrency = 1
 				}
+				// An edge provider selection scopes every probe to that platform
+				// hostnames (workers.dev, vercel.app, onrender.com, ...), so an
+				// accepted IP is one that really serves that platform.
+				if p := config.GetEdgeProvider(cfg.EdgeProvider); p != nil && len(p.ProbeDomains) > 0 {
+					opts.ProbeDomainsHTTP = append([]string(nil), p.ProbeDomains...)
+					opts.ProbeDomainsHTTPS = append([]string(nil), p.ProbeDomains...)
+				}
 				if opType == "sni_scanner" || opType == "desync_scanner" {
 					// SNI scanner uses tlsprobe hostnames for the TLS hostname probe path.
 					// Prefer user-supplied domains from the inline SNI-source prompt,
-					// falling back to the managed default list.
+					// then the selected edge provider, falling back to the managed list.
 					domains := cfg.SNIDomains
+					if len(domains) == 0 {
+						domains = opts.ProbeDomainsHTTPS
+					}
 					if len(domains) == 0 {
 						domains = tlsprobe.GetDomains(m.app.DataDir)
 					}
@@ -3430,9 +3603,15 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 								_ = storage.AppendLine(m.scanFailedPath, text)
 							}
 						} else {
-							// record passed ip:port to incremental passed file
+							// Record the ip:port and the SNI it accepted. A bare
+							// endpoint is useless here: the pair is the result, and
+							// it is what a fronting config has to be built from.
 							if m.scanOutputPath != "" {
-								_ = storage.AppendLine(m.scanOutputPath, net.JoinHostPort(pr.IP, strconv.Itoa(pr.Port)))
+								line := net.JoinHostPort(pr.IP, strconv.Itoa(pr.Port)) + "\t" + pr.Hostname
+								if pr.CertMatchesSNI {
+									line += "\tcert-match"
+								}
+								_ = storage.AppendLine(m.scanOutputPath, line)
 							}
 						}
 						// forward progress update
@@ -3806,9 +3985,16 @@ func (m tuiModel) runSpeedRank(ch chan tea.Msg, scannerInst *scanner.Scanner, ta
 	if conc <= 0 {
 		conc = 16
 	}
+	// Rank against the platform being scanned: its own hostname is the only
+	// pinned transfer available on an edge that is not Cloudflare.
+	sni := ""
+	if p := config.GetEdgeProvider(cfg.EdgeProvider); p != nil && len(p.ProbeDomains) > 0 {
+		sni = p.ProbeDomains[0]
+	}
 	opts := scanner.SpeedRankOptions{
 		Port:        port,
 		Concurrency: conc,
+		SNI:         sni,
 		PauseFunc: func() bool {
 			return scannerInst != nil && scannerInst.IsPaused()
 		},

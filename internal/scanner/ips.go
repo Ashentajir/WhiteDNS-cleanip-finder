@@ -191,6 +191,14 @@ type IPScanOptions struct {
 	// 2000 on large scans. Mobile sets this so it never saturates a phone's
 	// bandwidth / fd table (which disconnects the device and yields zero results).
 	DisableAutoConcurrency bool
+	// FastMode trades thoroughness for wall-clock time: an endpoint stops
+	// probing domains as soon as enough of them have confirmed it, probes are
+	// not retried, per-attempt timeouts drop the padding added for flaky links,
+	// and unresponsive IPs are culled sooner. The accept/reject verdict is
+	// reached by the same rule — a fast scan just stops working once the answer
+	// is known, so it finds the same endpoints and reports fewer passed domains
+	// per endpoint. Slow or lossy links should leave it off.
+	FastMode bool
 }
 
 type deadIPState struct {
@@ -748,6 +756,9 @@ func (s *Scanner) runThreeWavePipeline(ctx context.Context, endpoints []simpleEn
 	var deadCount int32
 	useDeadCull := len(endpoints) >= 100
 	deadThreshold := 10
+	if opts.FastMode {
+		deadThreshold = 3
+	}
 	if !useDeadCull {
 		deadThreshold = len(endpoints)
 	}
@@ -913,36 +924,50 @@ const maxIPv6PerCIDR = 256
 
 // expandCIDR expands a CIDR block to individual IPs
 func expandCIDR(cidr string, maxIPs int) ([]string, error) {
-	_, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		ip := net.ParseIP(cidr)
-		if ip != nil {
+	// Single targets need no CIDR parser, mask, or expansion loop.
+	if !strings.Contains(cidr, "/") {
+		if ip := net.ParseIP(cidr); ip != nil {
 			return []string{cidr}, nil
 		}
+	}
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
 		return nil, err
 	}
-
-	if ipnet.IP.To4() == nil && maxIPs > maxIPv6PerCIDR {
+	if maxIPs <= 0 {
+		return nil, nil
+	}
+	if start := ipToInt(ipnet.IP); start >= 0 {
+		ones, bits := ipnet.Mask.Size()
+		count := int64(1) << uint(bits-ones)
+		if count > int64(maxIPs) {
+			count = int64(maxIPs)
+		}
+		ips := make([]string, int(count))
+		for i := range ips {
+			ips[i] = ipv4String(start + int64(i))
+		}
+		return ips, nil
+	}
+	if maxIPs > maxIPv6PerCIDR {
 		maxIPs = maxIPv6PerCIDR
 	}
-	if ipnet.IP.To4() == nil {
-		ones, bits := ipnet.Mask.Size()
-		if bits == 128 && bits-ones > 8 {
-			return sampleIPv6CIDR(ipnet, maxIPs), nil
-		}
+	ones, bits := ipnet.Mask.Size()
+	if bits-ones > 8 {
+		return sampleIPv6CIDR(ipnet, maxIPs), nil
 	}
-
-	var ips []string
-	for ip := ipnet.IP.Mask(ipnet.Mask); ipnet.Contains(ip); incrementIP(ip) {
-		if len(ips) >= maxIPs {
-			break
-		}
-		ips = append(ips, ip.String())
+	count := 1 << uint(bits-ones)
+	if count > maxIPs {
+		count = maxIPs
 	}
-
+	ips := make([]string, count)
+	ip := ipnet.IP.Mask(ipnet.Mask)
+	for i := range ips {
+		ips[i] = ip.String()
+		incrementIP(ip)
+	}
 	return ips, nil
 }
-
 func sampleIPv6CIDR(network *net.IPNet, limit int) []string {
 	if network == nil || limit <= 0 || network.IP.To4() != nil {
 		return nil
@@ -1056,7 +1081,7 @@ func (s *Scanner) probeIP(ctx context.Context, ip string, port int, opts IPScanO
 	// probe could have connected to still connects here. Only IPs that cannot
 	// establish a TCP connection at all (i.e. would be marked dead anyway) are
 	// culled — just faster.
-	connectTimeout := probeTimeoutForDomain("workers.dev", opts.Timeout, 0, opts.EndpointCount)
+	connectTimeout := probeTimeoutForDomain("workers.dev", opts.Timeout, 0, opts.EndpointCount, opts.FastMode)
 	if connectTimeout <= 0 {
 		connectTimeout = ScanTimeout
 	}
@@ -1102,38 +1127,46 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 		accepted bool
 	}
 
+	// Domain probes share a cancellable context so a fast scan can drop the
+	// ones still in flight the moment the endpoint has been decided.
+	probeCtx, cancelProbes := context.WithCancel(ctx)
+	defer cancelProbes()
+
 	probeDomain := func(domain string) domainOutcome {
 		result := &IPScanResult{IP: ip, Port: port, Domain: domain, DomainTotal: len(domains), DomainsTested: 1}
-		attempts := s.retryAttemptsForDomain(domain)
+		attempts := s.retryAttemptsForDomain(domain, opts.FastMode)
 		retrySleep := retrySleepDuration(domain, opts.EndpointCount)
 
 		for attempt := 0; attempt < attempts; attempt++ {
-			if ctx.Err() != nil {
+			if probeCtx.Err() != nil {
 				result.Status = "dead"
-				result.Error = ctx.Err().Error()
+				result.Error = probeCtx.Err().Error()
 				return domainOutcome{result: result}
 			}
 			if attempt > 0 {
 				time.Sleep(retrySleep)
 			}
 
-			attemptTimeout := probeTimeoutForDomain(domain, opts.Timeout, attempt, opts.EndpointCount)
-			reqCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+			attemptTimeout := probeTimeoutForDomain(domain, opts.Timeout, attempt, opts.EndpointCount, opts.FastMode)
+			reqCtx, cancel := context.WithTimeout(probeCtx, attemptTimeout)
 			url := fmt.Sprintf("http://%s%s", hostPort(ip, port), probePathForDomain(domain, attempt))
 			req, _ := http.NewRequestWithContext(reqCtx, "GET", url, nil)
-			req.Header.Set("Host", domain)
+			// net/http ignores a "Host" entry in Header and sends URL.Host, so the
+			// probe domain has to go on req.Host or every HTTP probe asks the IP
+			// for its own default site and no domain token can ever match.
+			req.Host = domain
 			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 			req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json")
 			req.Header.Set("Accept-Encoding", "identity")
 			req.Close = false
 
 			resp, err := s.httpClient.Do(req)
-			cancel()
 			if err != nil {
-				if ctx.Err() != nil {
+				cancel()
+				if probeCtx.Err() != nil {
 					s.logf("[PROBE-TIMEOUT] %s:%d domain=%s hard-deadline reached (HTTP attempt %d)\n", ip, port, domain, attempt)
 					result.Status = "dead"
-					result.Error = ctx.Err().Error()
+					result.Error = probeCtx.Err().Error()
 					return domainOutcome{result: result}
 				}
 				if strings.Contains(err.Error(), "timeout") {
@@ -1145,8 +1178,14 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 				continue
 			}
 
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8192))
 			resp.Body.Close()
+			cancel()
+			if readErr != nil {
+				result.Status = "dead"
+				result.Error = readErr.Error()
+				continue
+			}
 
 			result.StatusCode = resp.StatusCode
 			result.Status = classifyResponse(resp.StatusCode, body, resp.Header, domain)
@@ -1198,6 +1237,7 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 
 	result := &IPScanResult{IP: ip, Port: port, DomainTotal: len(domains), DomainsTested: len(domains), PassedDomains: []string{}}
 	domainScore := 0
+	acceptThreshold := minimumDomainAcceptScore(len(domains))
 	var bestResult *IPScanResult
 	for outcome := range outcomes {
 		if outcome.accepted {
@@ -1209,6 +1249,10 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 				copyResult := *outcome.result
 				bestResult = &copyResult
 			}
+			if opts.FastMode && domainScore >= acceptThreshold {
+				// Verdict reached; the remaining domains cannot change it.
+				cancelProbes()
+			}
 			continue
 		}
 		if outcome.result != nil && outcome.result.Status != "" && result.Status == "" {
@@ -1219,7 +1263,6 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 
 	result.DomainScore = domainScore
 	if bestResult != nil {
-		acceptThreshold := minimumDomainAcceptScore(len(domains))
 		bestResult.DomainScore = domainScore
 		bestResult.DomainTotal = len(domains)
 		bestResult.DomainsTested = len(domains)
@@ -1315,29 +1358,34 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 		accepted bool
 	}
 
+	// Domain probes share a cancellable context so a fast scan can drop the
+	// ones still in flight the moment the endpoint has been decided.
+	probeCtx, cancelProbes := context.WithCancel(ctx)
+	defer cancelProbes()
+
 	probeDomain := func(domain string) domainOutcome {
 		result := &IPScanResult{IP: ip, Port: port, Domain: domain, DomainTotal: len(domains), DomainsTested: 1}
-		attempts := s.retryAttemptsForDomain(domain)
+		attempts := s.retryAttemptsForDomain(domain, opts.FastMode)
 		retrySleep := retrySleepDuration(domain, opts.EndpointCount)
 
 		for attempt := 0; attempt < attempts; attempt++ {
-			if ctx.Err() != nil {
+			if probeCtx.Err() != nil {
 				result.Status = "dead"
-				result.Error = ctx.Err().Error()
+				result.Error = probeCtx.Err().Error()
 				return domainOutcome{result: result}
 			}
 			if attempt > 0 {
 				time.Sleep(retrySleep)
 			}
 
-			attemptTimeout := probeTimeoutForDomain(domain, opts.Timeout, attempt, opts.EndpointCount)
+			attemptTimeout := probeTimeoutForDomain(domain, opts.Timeout, attempt, opts.EndpointCount, opts.FastMode)
 			dialer := &net.Dialer{Timeout: attemptTimeout}
-			conn, err := dialer.DialContext(ctx, "tcp", hostPort(ip, port))
+			conn, err := dialer.DialContext(probeCtx, "tcp", hostPort(ip, port))
 			if err != nil {
-				if ctx.Err() != nil {
+				if probeCtx.Err() != nil {
 					s.logf("[PROBE-TIMEOUT] %s:%d domain=%s hard-deadline reached at attempt %d\n", ip, port, domain, attempt)
 					result.Status = "dead"
-					result.Error = ctx.Err().Error()
+					result.Error = probeCtx.Err().Error()
 					return domainOutcome{result: result}
 				}
 				if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "refused") {
@@ -1481,6 +1529,10 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 				copyResult := *outcome.result
 				bestResult = &copyResult
 			}
+			if opts.FastMode {
+				// One confirmation is this path's accept rule; stop the rest.
+				cancelProbes()
+			}
 			continue
 		}
 		if outcome.result != nil && outcome.result.Status != "" && result.Status == "" {
@@ -1582,7 +1634,11 @@ func classifyResponse(statusCode int, body []byte, headers http.Header, domain s
 	return "reject"
 }
 
-func probeTimeoutForDomain(domain string, base time.Duration, attempt int, endpointCount int) time.Duration {
+func probeTimeoutForDomain(domain string, base time.Duration, attempt int, endpointCount int, fast bool) time.Duration {
+	if fast {
+		// No forgiveness padding: the budget the caller set is the budget.
+		return base
+	}
 	d := normalizedDomain(domain)
 	critical := d == "workers.dev" || d == "pages.dev"
 	var extra time.Duration
@@ -1665,7 +1721,7 @@ func retrySleepDuration(domain string, endpointCount int) time.Duration {
 
 func normalizeProbeDomains(input []string) []string {
 	seen := make(map[string]bool)
-	ordered := []string{"workers.dev", "pages.dev"}
+	var ordered []string
 	for _, d := range input {
 		clean := strings.ToLower(strings.TrimSpace(d))
 		if clean == "" {
@@ -1673,7 +1729,14 @@ func normalizeProbeDomains(input []string) []string {
 		}
 		ordered = append(ordered, clean)
 	}
-	ordered = append(ordered, "gemini.google.com", "notebooklm.google.com")
+	// A caller that named its own domains means them. Injecting workers.dev and
+	// friends here let an endpoint pass on a domain the caller never asked about
+	// — an edge-provider scan accepting an IP that only answers for Cloudflare,
+	// say. Callers that pass nothing get defaultProbeDomains, which already
+	// contains those names.
+	if len(ordered) == 0 {
+		ordered = append(ordered, defaultProbeDomains...)
+	}
 	out := make([]string, 0, len(ordered))
 	for _, d := range ordered {
 		if !seen[d] {
@@ -1705,7 +1768,12 @@ func cachedDomainTokens(domain string) []string {
 }
 
 // retryAttemptsForDomain returns retry attempts for a domain based on scanner config.
-func (s *Scanner) retryAttemptsForDomain(domain string) int {
+func (s *Scanner) retryAttemptsForDomain(domain string, fast bool) int {
+	if fast {
+		// One shot per domain: a retry only helps a flaky link, and a fast scan
+		// would rather move on to the next endpoint.
+		return 1
+	}
 	base := 2
 	if s != nil && s.config != nil && s.config.ProbeRetries > 0 {
 		base = s.config.ProbeRetries

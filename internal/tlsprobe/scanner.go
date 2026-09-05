@@ -60,13 +60,22 @@ func ProbeOneContext(ctx context.Context, ip, hostname string, port int, timeout
 	sniErr := tlsConn.Handshake()
 	if sniErr == nil {
 		r.SNIAccepted = true
-		r.Success = true
 		cs := tlsConn.ConnectionState()
 		recordCertInfo(&r, cs, hostname)
 		if r.CertMatchesSNI {
 			r.ResultKind = "cert-match"
 		} else {
 			r.ResultKind = "sni-ok"
+		}
+		// Certificates are not verified here, so almost every live TLS server
+		// completes a handshake for an unknown SNI and serves its default site.
+		// A handshake alone therefore says nothing. What makes a pair usable for
+		// SNI spoofing / domain fronting is the edge answering with a
+		// certificate that actually covers the requested hostname, so that is
+		// what strict mode requires.
+		r.Success = !strict || r.CertMatchesSNI
+		if !r.Success {
+			r.Error = "handshake accepted but certificate does not cover " + hostname
 		}
 		r.LatencyMs = float64(time.Since(start).Milliseconds())
 		if rem := time.Until(deadline); rem > 0 {
@@ -309,6 +318,14 @@ func RunScanContext(ctx context.Context, cfg ScanConfig, resultCh chan<- ProbeRe
 	var wg sync.WaitGroup
 	timeout := time.Duration(int64(cfg.TimeoutSec * float64(time.Second)))
 
+	// Every hostname on one ip:port dials the same socket, so an endpoint that
+	// will not accept a TCP connection costs the scan one full dial-with-retries
+	// per hostname — on a range of filtered IPs that is nearly the whole scan.
+	// Remember the endpoints that failed to connect and skip the rest of their
+	// tuples. Only a dial failure counts: a TLS or SNI rejection says nothing
+	// about the other hostnames.
+	var deadEndpoints sync.Map
+
 	for i := 0; i < cfg.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
@@ -324,7 +341,21 @@ func RunScanContext(ctx context.Context, cfg ScanConfig, resultCh chan<- ProbeRe
 					if !waitWhilePaused(ctx, cfg.PauseFunc) {
 						return
 					}
-					res := ProbeOneContext(ctx, j.ip, j.host, j.port, timeout, cfg.StrictSNI)
+					endpoint := net.JoinHostPort(j.ip, strconv.Itoa(j.port))
+					var res ProbeResult
+					if _, dead := deadEndpoints.Load(endpoint); dead {
+						res = ProbeResult{
+							IP: j.ip, Hostname: j.host, Port: j.port,
+							ResultKind: "fail",
+							Error:      "skipped: " + endpoint + " refused an earlier connection",
+							ScannedAt:  time.Now(),
+						}
+					} else {
+						res = ProbeOneContext(ctx, j.ip, j.host, j.port, timeout, cfg.StrictSNI)
+						if isDialFailure(res) {
+							deadEndpoints.Store(endpoint, struct{}{})
+						}
+					}
 					if resultCh != nil {
 						select {
 						case resultCh <- res:
@@ -358,6 +389,16 @@ producer:
 	}
 	close(jobs)
 	wg.Wait()
+}
+
+// isDialFailure reports whether a probe failed before TLS, i.e. the endpoint
+// would not accept a TCP connection at all. dialWithRetries has already spent
+// its retries by then, so this is not a one-off blip.
+func isDialFailure(r ProbeResult) bool {
+	if r.Success || r.Error == "" {
+		return false
+	}
+	return strings.HasPrefix(r.Error, "tcp connect")
 }
 
 func waitWhilePaused(ctx context.Context, pauseFunc func() bool) bool {

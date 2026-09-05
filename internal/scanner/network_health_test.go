@@ -81,7 +81,7 @@ func TestScanIPsWithProgressLocalHTTP(t *testing.T) {
 
 	s := NewScanner(&ScannerConfig{})
 	s.httpClient = &http.Client{Transport: probeRoundTripper(func(req *http.Request) (*http.Response, error) {
-		host := req.Header.Get("Host")
+		host := req.Host
 		if host == "example.com" || host == "gemini.google.com" {
 			return newMockProbeResponse(http.StatusOK, "<html><body>Example Domain example.com gemini.google.com</body></html>"), nil
 		}
@@ -114,7 +114,7 @@ func TestScanIPsRejectsSingleNoisyHitAcrossMultipleDomains(t *testing.T) {
 
 	s := NewScanner(&ScannerConfig{})
 	s.httpClient = &http.Client{Transport: probeRoundTripper(func(req *http.Request) (*http.Response, error) {
-		if req.Header.Get("Host") == "example.com" {
+		if req.Host == "example.com" {
 			return newMockProbeResponse(http.StatusOK, "<html><body>Example Domain example.com</body></html>"), nil
 		}
 		return newMockProbeResponse(http.StatusServiceUnavailable, "noise"), nil

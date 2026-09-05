@@ -23,6 +23,16 @@ type ScanConfig struct {
 	LiteMode      bool   // low-RAM/CPU mode for old/low-end devices (smaller chunks,
 	// lower concurrency, sequential domain probing, inter-chunk pauses)
 
+	// FastMode stops probing an endpoint once enough domains have confirmed it
+	// and skips retries: the same verdict with less work. Ignored in LiteMode /
+	// LowBandwidth, where the extra attempts are what make a hit findable.
+	FastMode bool
+
+	// EdgeProvider names a config.EdgeProvider (see EdgeProviderList) whose edge
+	// IPs are being scanned. It scopes the probe hostnames to that platform, so an
+	// accepted IP is one that really serves it. Empty for plain target scans.
+	EdgeProvider string
+
 	// DNS resolver / tunnel scan (StartDNSScan) options.
 	DNSProtocol   string // "udp" | "tcp" | "both" | "all" (default "both"); "all" also probes DoT/DoH
 	DNSReference  string // truth-table reference resolver: "google" (default) | "cloudflare" | "quad9"

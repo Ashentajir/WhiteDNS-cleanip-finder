@@ -7,15 +7,21 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.whitescan.app.ScanKind
 
 data class FormState(
@@ -26,6 +32,14 @@ data class FormState(
     val transferModel: String = "old",
     val sniDomains: String = "",
     val sniStrict: Boolean = false,
+    // Edge platform the scan is scoped to (see EdgePickerScreen). The engine
+    // probes that platform's hostnames, so an accepted IP is one that serves it.
+    val edgeProvider: String = "",
+    val edgeProbeDomains: String = "",
+    // Fast scans stop probing an endpoint once its verdict is settled: same
+    // accepted IPs, less work each. The engine ignores it in Lite / low-bandwidth
+    // mode, where the extra attempts are what make a hit findable at all.
+    val fastMode: Boolean = false,
     val verboseLog: Boolean = false,
     val liteMode: Boolean = false,
     val dnsProtocol: String = "both",     // dnsscan.Options.Protocol: udp | tcp | both | all
@@ -42,24 +56,15 @@ data class FormState(
     val e2eTransport: String = "udp",     // udp | tcp (both working) | dot | doh (gated)
 )
 
-// Common single ports offered as checkboxes (multi-select). Ranges / anything
-// else can still be typed in the custom field below.
-private val COMMON_PORTS = listOf(
-    "80", "443", "2053", "2083", "2087", "2096", "8443", "8080", "3128", "8000", "8888",
+// Port sets people actually reach for, named by what they cover. Anything else
+// goes in Custom, which keeps the ports field out of the way until it is wanted.
+private data class PortPreset(val label: String, val ports: String)
+private val PORT_PRESETS = listOf(
+    PortPreset("HTTPS", "443"),
+    PortPreset("Web", "80,443"),
+    PortPreset("Cloudflare TLS", "443,2053,2083,2087,2096,8443"),
+    PortPreset("Proxy ports", "80,8080,3128,1080"),
 )
-
-// Parse a ports CSV into its trimmed tokens.
-private fun portTokens(csv: String): List<String> =
-    csv.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-
-private fun hasPort(csv: String, port: String): Boolean = portTokens(csv).contains(port)
-
-// Toggle a single port in/out of the CSV, preserving any other tokens (ranges).
-private fun togglePort(csv: String, port: String): String {
-    val parts = portTokens(csv).toMutableList()
-    if (parts.contains(port)) parts.remove(port) else parts.add(port)
-    return parts.joinToString(",")
-}
 
 // Android-safe worker modes. High fanout on a phone saturates the radio and
 // disconnects the device, so the modes are tuned down. "Ultra-light" and
@@ -118,434 +123,610 @@ fun ScanConfigForm(
     onFormChange: (FormState) -> Unit,
     onStart: () -> Unit,
     onPickASN: () -> Unit,
+    onPickEdge: () -> Unit,
 ) {
     val ctx = LocalContext.current
     var showWorkerMenu by remember { mutableStateOf(false) }
-    var showCustomConcurrency by remember { mutableStateOf(false) }
+    var showAdvanced by remember { mutableStateOf(false) }
+    var showCustomWorkers by remember {
+        mutableStateOf(CONCURRENCY_PRESETS.none { it.value == form.concurrency })
+    }
+    // Ports that match no preset are the user's own, so the field stays open.
+    var customPorts by remember {
+        mutableStateOf(form.ports.isNotBlank() && PORT_PRESETS.none { it.ports == form.ports })
+    }
 
-    LazyColumn(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
+    Column(Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
 
-        // ── Targets ───────────────────────────────────────────────────────────
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                SectionLabel("Targets  (IPs / CIDRs / ASNs)")
-                TextButton(onClick = {
-                    paste(ctx) { text ->
-                        val sep = if (form.targets.isBlank()) text
-                                  else "${form.targets.trimEnd()}\n$text"
-                        onFormChange(form.copy(targets = sep))
-                    }
-                }) {
-                    Icon(Icons.Default.ContentPaste, contentDescription = "Paste",
-                        modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Paste")
-                }
-            }
-            Spacer(Modifier.height(4.dp))
-            OutlinedTextField(
-                value = form.targets,
-                onValueChange = { onFormChange(form.copy(targets = it)) },
-                modifier = Modifier.fillMaxWidth().height(120.dp),
-                placeholder = { Text("1.2.3.0/24\n5.6.7.8") },
-            )
-            Spacer(Modifier.height(8.dp))
-            // Prominent full-width ASN picker button (big touch target), purple
-            Button(
-                onClick = onPickASN,
-                modifier = Modifier.fillMaxWidth().height(50.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Lavender,
-                    contentColor = androidx.compose.ui.graphics.Color(0xFF1A0050),
-                ),
-            ) {
-                Icon(Icons.Default.Dns, contentDescription = null, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Select from ASN list")
-            }
-        }
-
-        // ── Ports (checkbox multi-select) — not for DNS, which picks a transport
-        // preset below instead (port + protocol are coupled for that scan) ─────
-        if (kind != ScanKind.DNS) {
+            // ── Targets ──────────────────────────────────────────────────────
             item {
-                SectionLabel("Ports")
-                Spacer(Modifier.height(4.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    COMMON_PORTS.forEach { p ->
-                        FilterChip(
-                            selected = hasPort(form.ports, p),
-                            onClick = { onFormChange(form.copy(ports = togglePort(form.ports, p))) },
-                            label = { Text(p) },
-                            modifier = Modifier.height(36.dp),
-                        )
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = form.ports,
-                    onValueChange = { onFormChange(form.copy(ports = it)) },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Selected ports (edit / add ranges)") },
-                    placeholder = { Text("443,2053,8000-8100") },
-                    singleLine = true,
-                )
-            }
-        }
-
-        // ── DNS transport + reference resolver + nearby — matches TUI screenDNSPorts
-        // / screenDNSReference / screenDNSNearby ────────────────────────────────
-        if (kind == ScanKind.DNS) {
-            item {
-                SectionLabel("DNS transport")
-                Spacer(Modifier.height(4.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    DNS_TRANSPORT_PRESETS.forEach { preset ->
-                        FilterChip(
-                            selected = form.dnsProtocol == preset.protocol && form.ports == preset.ports,
-                            onClick = {
-                                onFormChange(form.copy(dnsProtocol = preset.protocol, ports = preset.ports))
-                            },
-                            label = { Text(preset.label) },
-                            modifier = Modifier.fillMaxWidth().height(40.dp),
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(14.dp))
-                SectionLabel("Scan depth")
-                Spacer(Modifier.height(4.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    DNS_DEPTH_PRESETS.forEach { preset ->
-                        FilterChip(
-                            selected = form.dnsScanDepth == preset.value,
-                            onClick = { onFormChange(form.copy(dnsScanDepth = preset.value)) },
-                            label = { Text(preset.label) },
-                            modifier = Modifier.fillMaxWidth().height(40.dp),
-                        )
-                    }
-                }
-                Text(
-                    if (form.dnsScanDepth == "fast")
-                        "Uses a short probe deadline and skips UDP compatibility retries and NXDOMAIN hijack probes"
-                    else
-                        "Runs compatibility retries and repeated NXDOMAIN hijack validation",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-
-                Spacer(Modifier.height(14.dp))
-                SectionLabel("Reference resolver (poisoning truth table)")
-                Spacer(Modifier.height(4.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    DNS_REFERENCE_PRESETS.forEach { preset ->
-                        FilterChip(
-                            selected = form.dnsReference == preset.value,
-                            onClick = { onFormChange(form.copy(dnsReference = preset.value)) },
-                            label = { Text(preset.label) },
-                            modifier = Modifier.fillMaxWidth().height(40.dp),
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(14.dp))
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Switch(
-                        checked = form.dnsTestNearby,
-                        enabled = !form.liteMode,
-                        onCheckedChange = { onFormChange(form.copy(dnsTestNearby = it)) },
-                    )
-                    Column {
-                        Text("Test Nearby IPs", style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            if (form.liteMode)
-                                "Disabled in Lite mode — each hit would expand into a 256-address /24 rescan"
-                            else
-                                "Also expand + rescan the /24 around every tunnel-ready resolver found",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-
-                // ── DNSTT end-to-end test (runs after this DNS scan) ──────────
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(12.dp))
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Switch(
-                        checked = form.e2eEnabled,
-                        onCheckedChange = { onFormChange(form.copy(e2eEnabled = it)) },
-                    )
-                    Column {
-                        Text("End-to-end tunnel test", style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            "After the DNS scan, bring up a real DNSTT tunnel through each tunnel-ready resolver and keep only the ones that carry traffic",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-
-                if (form.e2eEnabled) {
-                    Spacer(Modifier.height(10.dp))
-                    OutlinedTextField(
-                        value = form.e2eDomain,
-                        onValueChange = { onFormChange(form.copy(e2eDomain = it)) },
+                FormSection("TARGETS") {
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("DNSTT domain") },
-                        placeholder = { Text("t.example.com") },
-                        singleLine = true,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "IPs, CIDRs or ASN ranges — one per line",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = {
+                            paste(ctx) { text ->
+                                val sep = if (form.targets.isBlank()) text
+                                          else "${form.targets.trimEnd()}\n$text"
+                                onFormChange(form.copy(targets = sep))
+                            }
+                        }) {
+                            Icon(Icons.Default.ContentPaste, contentDescription = null,
+                                modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Paste")
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = form.targets,
+                        onValueChange = { onFormChange(form.copy(targets = it)) },
+                        modifier = Modifier.fillMaxWidth().height(112.dp),
+                        placeholder = { Text("1.2.3.0/24\n5.6.7.8") },
                     )
+                    Spacer(Modifier.height(10.dp))
+                    Button(
+                        onClick = onPickASN,
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Lavender,
+                            contentColor = androidx.compose.ui.graphics.Color(0xFF1A0050),
+                        ),
+                    ) {
+                        Icon(Icons.Default.Dns, contentDescription = null, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Select from ASN list")
+                    }
                     Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = form.e2ePubKey,
-                        onValueChange = { onFormChange(form.copy(e2ePubKey = it)) },
-                        modifier = Modifier.fillMaxWidth(),
-                        label = { Text("DNSTT public key (hex)") },
-                        placeholder = { Text("64 hex chars") },
-                        singleLine = true,
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    Text("Transport", style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.height(4.dp))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        E2E_TRANSPORT_PRESETS.forEach { preset ->
+                    OutlinedButton(
+                        onClick = onPickEdge,
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                    ) {
+                        Icon(Icons.Default.CloudQueue, contentDescription = null,
+                            modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Pick an edge network")
+                    }
+                    if (form.edgeProvider.isNotBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                        EdgeScopeStrip(
+                            provider = form.edgeProvider,
+                            probeDomains = form.edgeProbeDomains,
+                            onClear = {
+                                onFormChange(form.copy(edgeProvider = "", edgeProbeDomains = ""))
+                            },
+                        )
+                    }
+                }
+            }
+
+            // ── Ports (everything but DNS, which couples port to transport) ───
+            if (kind != ScanKind.DNS) {
+                item {
+                    FormSection("PORTS") {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            PORT_PRESETS.forEach { preset ->
+                                FilterChip(
+                                    selected = !customPorts && form.ports == preset.ports,
+                                    onClick = {
+                                        customPorts = false
+                                        onFormChange(form.copy(ports = preset.ports))
+                                    },
+                                    label = { Text(preset.label) },
+                                    modifier = Modifier.height(36.dp),
+                                )
+                            }
                             FilterChip(
-                                selected = form.e2eTransport == preset.value,
-                                enabled = preset.enabled,
-                                onClick = { onFormChange(form.copy(e2eTransport = preset.value)) },
-                                label = { Text(preset.label) },
+                                selected = customPorts,
+                                onClick = { customPorts = true },
+                                label = { Text("Custom") },
                                 modifier = Modifier.height(36.dp),
                             )
                         }
+                        if (customPorts) {
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedTextField(
+                                value = form.ports,
+                                onValueChange = { onFormChange(form.copy(ports = it)) },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("Ports and ranges") },
+                                placeholder = { Text("443,2053,8000-8100") },
+                                singleLine = true,
+                            )
+                        } else {
+                            Spacer(Modifier.height(8.dp))
+                            DataLine(
+                                if (form.ports.isBlank()) "Engine defaults"
+                                else form.ports.split(",").joinToString("  ") { it.trim() }
+                            )
+                        }
                     }
-                    Text(
-                        "UDP and TCP are available (TCP helps where UDP/53 is poisoned) — DoT/DoH are coming soon",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
                 }
             }
-        }
 
-        // ── Workers (dropdown) + Low-bandwidth ────────────────────────────────
-        item {
-            SectionLabel("Workers")
-            Spacer(Modifier.height(4.dp))
-            val currentLabel = when {
-                showCustomConcurrency -> "Custom (${form.concurrency})"
-                else -> CONCURRENCY_PRESETS.find {
-                    it.value == form.concurrency && it.lowBw == form.lowBandwidth
-                }?.label ?: "Custom (${form.concurrency})"
-            }
-            Box(Modifier.fillMaxWidth()) {
-                OutlinedButton(
-                    onClick = { showWorkerMenu = true },
-                    modifier = Modifier.fillMaxWidth().height(50.dp),
-                ) {
-                    Text(currentLabel, modifier = Modifier.weight(1f))
-                    Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+            // ── DNS transport / depth / reference — matches the desktop screens ─
+            if (kind == ScanKind.DNS) {
+                item {
+                    FormSection("DNS TRANSPORT") {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            DNS_TRANSPORT_PRESETS.forEach { preset ->
+                                FilterChip(
+                                    selected = form.dnsProtocol == preset.protocol && form.ports == preset.ports,
+                                    onClick = {
+                                        onFormChange(form.copy(dnsProtocol = preset.protocol, ports = preset.ports))
+                                    },
+                                    label = { Text(preset.label) },
+                                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                                )
+                            }
+                        }
+                    }
                 }
-                DropdownMenu(expanded = showWorkerMenu, onDismissRequest = { showWorkerMenu = false }) {
-                    CONCURRENCY_PRESETS.forEach { preset ->
-                        DropdownMenuItem(
-                            text = { Text(preset.label) },
-                            onClick = {
-                                showCustomConcurrency = false
-                                onFormChange(form.copy(concurrency = preset.value, lowBandwidth = preset.lowBw))
-                                showWorkerMenu = false
-                            },
+                item {
+                    FormSection("SCAN DEPTH") {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            DNS_DEPTH_PRESETS.forEach { preset ->
+                                FilterChip(
+                                    selected = form.dnsScanDepth == preset.value,
+                                    onClick = { onFormChange(form.copy(dnsScanDepth = preset.value)) },
+                                    label = { Text(preset.label) },
+                                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            if (form.dnsScanDepth == "fast")
+                                "Uses a short probe deadline and skips UDP compatibility retries and NXDOMAIN hijack probes"
+                            else
+                                "Runs compatibility retries and repeated NXDOMAIN hijack validation",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    DropdownMenuItem(
-                        text = { Text("Custom…") },
-                        onClick = { showCustomConcurrency = true; showWorkerMenu = false },
-                    )
                 }
-            }
-            if (showCustomConcurrency) {
-                Spacer(Modifier.height(6.dp))
-                OutlinedTextField(
-                    value = form.concurrency,
-                    onValueChange = { onFormChange(form.copy(concurrency = it)) },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Custom worker count") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                )
-            }
-            Spacer(Modifier.height(10.dp))
-            // Low-bandwidth switch separate from chips (matching TUI's separate toggle)
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Switch(
-                    checked = form.lowBandwidth,
-                    onCheckedChange = { onFormChange(form.copy(lowBandwidth = it)) },
-                )
-                Column {
-                    Text("Low bandwidth mode", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "Extends timeouts for slow / high-latency links",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-            // Lite mode — for old / low-RAM devices that crash on big scans.
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Switch(
-                    checked = form.liteMode,
-                    onCheckedChange = { onFormChange(form.copy(liteMode = it)) },
-                )
-                Column {
-                    Text("Lite mode (old / low-RAM devices)", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "Smaller batches and low concurrency to avoid crashes on weak phones (slower, same coverage)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-            // Verbose probe logging — off by default for speed.
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Switch(
-                    checked = form.verboseLog,
-                    onCheckedChange = { onFormChange(form.copy(verboseLog = it)) },
-                )
-                Column {
-                    Text("Verbose probe logging", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "Logs every IP probe (slower) — turn on only for debugging",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        }
-
-        // ── Speed test (IP scan only) — runs after the scan on the IPs it found ──
-        if (kind == ScanKind.IP) {
-            item {
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(12.dp))
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Switch(
-                        checked = form.speedTestEnabled,
-                        onCheckedChange = { onFormChange(form.copy(speedTestEnabled = it)) },
-                    )
-                    Column {
-                        Text("Speed test", style = MaterialTheme.typography.bodyMedium)
+                item {
+                    FormSection("REFERENCE RESOLVER") {
                         Text(
-                            "After this scan finds clean IPs, benchmark them and rank by download/upload speed and ping (uses extra data)",
+                            "The trusted resolver every answer is checked against for poisoning",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            DNS_REFERENCE_PRESETS.forEach { preset ->
+                                FilterChip(
+                                    selected = form.dnsReference == preset.value,
+                                    onClick = { onFormChange(form.copy(dnsReference = preset.value)) },
+                                    label = { Text(preset.label) },
+                                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        SwitchRow(
+                            checked = form.dnsTestNearby,
+                            enabled = !form.liteMode,
+                            title = "Test nearby IPs",
+                            detail = if (form.liteMode)
+                                "Off in Lite mode — each hit would expand into a 256-address /24 rescan"
+                            else
+                                "Also expand and rescan the /24 around every tunnel-ready resolver found",
+                            onCheckedChange = { onFormChange(form.copy(dnsTestNearby = it)) },
+                        )
+                    }
+                }
+            }
+
+            // ── Transfer model (HTTP / SOCKS5 only) ──────────────────────────
+            if (kind == ScanKind.HTTP || kind == ScanKind.SOCKS5) {
+                item {
+                    FormSection("TRANSFER MODEL") {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("old" to "Stable", "brrr" to "Fast (goBrrrr)").forEach { (model, label) ->
+                                FilterChip(
+                                    selected = form.transferModel == model,
+                                    onClick = { onFormChange(form.copy(transferModel = model)) },
+                                    label = { Text(label) },
+                                    modifier = Modifier.height(40.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── SNI domains + match mode (SNI scan only) ─────────────────────
+            if (kind == ScanKind.SNI) {
+                item {
+                    FormSection("SNI DOMAINS") {
+                        Text(
+                            "Leave blank to probe the built-in list",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Top) {
+                            OutlinedTextField(
+                                value = form.sniDomains,
+                                onValueChange = { onFormChange(form.copy(sniDomains = it)) },
+                                modifier = Modifier.weight(1f).height(90.dp),
+                                placeholder = { Text("workers.dev\npages.dev") },
+                            )
+                            FilledTonalIconButton(
+                                onClick = { paste(ctx) { text ->
+                                    val sep = if (form.sniDomains.isBlank()) text
+                                              else "${form.sniDomains.trimEnd()}\n$text"
+                                    onFormChange(form.copy(sniDomains = sep))
+                                } },
+                                modifier = Modifier.size(48.dp).align(Alignment.CenterVertically),
+                            ) { Icon(Icons.Default.ContentPaste, contentDescription = "Paste domains") }
+                        }
+                        Spacer(Modifier.height(12.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FilterChip(
+                                selected = form.sniStrict,
+                                onClick = { onFormChange(form.copy(sniStrict = true)) },
+                                label = { Text("Strict") },
+                                modifier = Modifier.height(40.dp),
+                            )
+                            FilterChip(
+                                selected = !form.sniStrict,
+                                onClick = { onFormChange(form.copy(sniStrict = false)) },
+                                label = { Text("Lenient") },
+                                modifier = Modifier.height(40.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            if (form.sniStrict)
+                                "Strict: keeps a pair only when the edge answers that hostname with a certificate for it — the pairs you can actually spoof with"
+                            else
+                                "Lenient: any TLS handshake counts, including edges serving some other name",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
             }
-        }
 
-        // ── Transfer model (HTTP / SOCKS5 only) — matches TUI screenSelectTransfer ─
-        if (kind == ScanKind.HTTP || kind == ScanKind.SOCKS5) {
+            // ── Scan rate ────────────────────────────────────────────────────────
             item {
-                SectionLabel("Transfer model")
-                Spacer(Modifier.height(4.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("old" to "Stable (old)", "brrr" to "Fast (goBrrrr)").forEach { (model, label) ->
-                        FilterChip(
-                            selected = form.transferModel == model,
-                            onClick = { onFormChange(form.copy(transferModel = model)) },
-                            label = { Text(label) },
-                            modifier = Modifier.height(40.dp),
+                FormSection("SCAN RATE") {
+                    val currentLabel = if (showCustomWorkers) "Custom (${form.concurrency} workers)"
+                    else CONCURRENCY_PRESETS.find {
+                        it.value == form.concurrency && it.lowBw == form.lowBandwidth
+                    }?.label ?: "Custom (${form.concurrency} workers)"
+                    Box(Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = { showWorkerMenu = true },
+                            modifier = Modifier.fillMaxWidth().height(50.dp),
+                        ) {
+                            Text(currentLabel, modifier = Modifier.weight(1f))
+                            Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                        }
+                        DropdownMenu(expanded = showWorkerMenu, onDismissRequest = { showWorkerMenu = false }) {
+                            CONCURRENCY_PRESETS.forEach { preset ->
+                                DropdownMenuItem(
+                                    text = { Text(preset.label) },
+                                    onClick = {
+                                        showCustomWorkers = false
+                                        onFormChange(form.copy(concurrency = preset.value, lowBandwidth = preset.lowBw))
+                                        showWorkerMenu = false
+                                    },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Custom…") },
+                                onClick = { showCustomWorkers = true; showWorkerMenu = false },
+                            )
+                        }
+                    }
+                    if (showCustomWorkers) {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = form.concurrency,
+                            onValueChange = { onFormChange(form.copy(concurrency = it)) },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Worker count") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    SwitchRow(
+                        checked = form.lowBandwidth,
+                        title = "Low bandwidth mode",
+                        detail = "Extends timeouts for slow or high-latency links",
+                        onCheckedChange = { onFormChange(form.copy(lowBandwidth = it)) },
+                    )
+                    if (kind == ScanKind.IP) {
+                        Spacer(Modifier.height(14.dp))
+                        Text("Effort per IP", style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FilterChip(
+                                selected = !form.fastMode,
+                                onClick = { onFormChange(form.copy(fastMode = false)) },
+                                label = { Text("Balanced") },
+                                modifier = Modifier.height(40.dp),
+                            )
+                            FilterChip(
+                                selected = form.fastMode,
+                                enabled = !form.lowBandwidth && !form.liteMode,
+                                onClick = { onFormChange(form.copy(fastMode = true)) },
+                                label = { Text("Fast") },
+                                modifier = Modifier.height(40.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            when {
+                                form.lowBandwidth || form.liteMode ->
+                                    "Fast is off on slow links and in Lite mode — the retries it drops are what find a hit there"
+                                form.fastMode ->
+                                    "Stops each IP as soon as its verdict is settled. Same IPs found, fewer probes each"
+                                else ->
+                                    "Tests every probe domain against every IP and retries flaky ones"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            // ── After the scan ───────────────────────────────────────────────
+            if (kind == ScanKind.IP || kind == ScanKind.DNS) {
+                item {
+                    FormSection("AFTER THE SCAN") {
+                        if (kind == ScanKind.IP) {
+                            SwitchRow(
+                                checked = form.speedTestEnabled,
+                                title = "Speed test the IPs found",
+                                detail = "Benchmarks every clean IP and ranks them by download, upload and ping (uses extra data)",
+                                onCheckedChange = { onFormChange(form.copy(speedTestEnabled = it)) },
+                            )
+                        }
+                        if (kind == ScanKind.DNS) {
+                            SwitchRow(
+                                checked = form.e2eEnabled,
+                                title = "End-to-end tunnel test",
+                                detail = "Brings up a real DNSTT tunnel through every tunnel-ready resolver and keeps the ones that carry traffic",
+                                onCheckedChange = { onFormChange(form.copy(e2eEnabled = it)) },
+                            )
+                            if (form.e2eEnabled) {
+                                Spacer(Modifier.height(12.dp))
+                                OutlinedTextField(
+                                    value = form.e2eDomain,
+                                    onValueChange = { onFormChange(form.copy(e2eDomain = it)) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    label = { Text("DNSTT domain") },
+                                    placeholder = { Text("t.example.com") },
+                                    singleLine = true,
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = form.e2ePubKey,
+                                    onValueChange = { onFormChange(form.copy(e2ePubKey = it)) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    label = { Text("DNSTT public key (hex)") },
+                                    placeholder = { Text("64 hex chars") },
+                                    singleLine = true,
+                                )
+                                Spacer(Modifier.height(12.dp))
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    E2E_TRANSPORT_PRESETS.forEach { preset ->
+                                        FilterChip(
+                                            selected = form.e2eTransport == preset.value,
+                                            enabled = preset.enabled,
+                                            onClick = { onFormChange(form.copy(e2eTransport = preset.value)) },
+                                            label = { Text(preset.label) },
+                                            modifier = Modifier.height(36.dp),
+                                        )
+                                    }
+                                }
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    "UDP and TCP are available — TCP helps where UDP/53 is poisoned. DoT and DoH are coming soon.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Advanced — set once, rarely touched again ────────────────────
+            item {
+                FormSection("ADVANCED") {
+                    TextButton(
+                        onClick = { showAdvanced = !showAdvanced },
+                        modifier = Modifier.fillMaxWidth().height(44.dp),
+                    ) {
+                        Text(
+                            if (showAdvanced) "Hide device and logging options"
+                            else "Device and logging options",
+                            modifier = Modifier.weight(1f),
+                        )
+                        Icon(
+                            if (showAdvanced) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = null,
+                        )
+                    }
+                    if (showAdvanced) {
+                        Spacer(Modifier.height(8.dp))
+                        SwitchRow(
+                            checked = form.liteMode,
+                            title = "Lite mode",
+                            detail = "Smaller batches and low concurrency so old or low-RAM phones don't crash (slower, same coverage)",
+                            onCheckedChange = { onFormChange(form.copy(liteMode = it)) },
+                        )
+                        Spacer(Modifier.height(14.dp))
+                        SwitchRow(
+                            checked = form.verboseLog,
+                            title = "Verbose probe logging",
+                            detail = "Logs every probe. Slows the scan down — turn it on to debug",
+                            onCheckedChange = { onFormChange(form.copy(verboseLog = it)) },
                         )
                     }
                 }
             }
         }
 
-        // ── SNI domains + strict mode — matches TUI screenSNISource / screenSNIMode ─
-        if (kind == ScanKind.SNI) {
-            item {
-                SectionLabel("SNI domains  (blank = built-in defaults)")
-                Spacer(Modifier.height(4.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Top) {
-                    OutlinedTextField(
-                        value = form.sniDomains,
-                        onValueChange = { onFormChange(form.copy(sniDomains = it)) },
-                        modifier = Modifier.weight(1f).height(90.dp),
-                        placeholder = { Text("workers.dev\npages.dev") },
+        // ── Start — pinned, so it never hides below a long form ──────────────
+        Surface(
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 3.dp,
+            shadowElevation = 8.dp,
+        ) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                if (form.targets.isBlank()) {
+                    Text(
+                        "Add a target above to start — paste IPs, pick ASNs, or choose an edge network.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    FilledTonalIconButton(
-                        onClick = { paste(ctx) { text ->
-                            val sep = if (form.sniDomains.isBlank()) text
-                                      else "${form.sniDomains.trimEnd()}\n$text"
-                            onFormChange(form.copy(sniDomains = sep))
-                        } },
-                        modifier = Modifier.size(48.dp).align(Alignment.CenterVertically),
-                    ) { Icon(Icons.Default.ContentPaste, contentDescription = "Paste domains") }
+                    Spacer(Modifier.height(8.dp))
                 }
-                Spacer(Modifier.height(8.dp))
-                // SNI match mode — matches TUI's screenSNIMode
-                Text("SNI match mode", style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(4.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = form.sniStrict,
-                        onClick = { onFormChange(form.copy(sniStrict = true)) },
-                        label = { Text("Strict") },
-                        modifier = Modifier.height(40.dp),
-                    )
-                    FilterChip(
-                        selected = !form.sniStrict,
-                        onClick = { onFormChange(form.copy(sniStrict = false)) },
-                        label = { Text("Lenient") },
-                        modifier = Modifier.height(40.dp),
-                    )
+                Button(
+                    onClick = onStart,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    enabled = form.targets.isNotBlank(),
+                ) {
+                    Text("Start scan", style = MaterialTheme.typography.titleSmall)
                 }
-                Text(
-                    if (form.sniStrict)
-                        "Strict: SNI must be accepted — domain fronting / SNI-spoofing discovery"
-                    else
-                        "Lenient: any TLS handshake counts — reachability only",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-
-        // ── Start ─────────────────────────────────────────────────────────────
-        item {
-            Spacer(Modifier.height(4.dp))
-            Button(
-                onClick = onStart,
-                modifier = Modifier.fillMaxWidth().height(52.dp),
-                enabled = form.targets.isNotBlank(),
-            ) {
-                Text("Start Scan", style = MaterialTheme.typography.titleSmall)
             }
         }
     }
 }
 
+// One group of settings. The mono label is the app's section marker — the same
+// device the edge picker uses — so the form reads as a few blocks instead of one
+// long strip of controls.
 @Composable
-private fun SectionLabel(text: String) {
+private fun FormSection(label: String, content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 14.dp)) {
+            Text(
+                label,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 2.sp,
+                color = CyanAccent,
+            )
+            Spacer(Modifier.height(10.dp))
+            content()
+        }
+    }
+}
+
+// A toggle and the sentence that explains what it changes.
+@Composable
+private fun SwitchRow(
+    checked: Boolean,
+    title: String,
+    detail: String,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(checked = checked, enabled = enabled, onCheckedChange = onCheckedChange)
+    }
+}
+
+// Engine values echoed back to the user in the app's data face.
+@Composable
+private fun DataLine(text: String) {
     Text(
         text,
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.primary,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 12.sp,
+        letterSpacing = 0.4.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+}
+
+// Shown once a platform is chosen: names what the scan is scoped to and the
+// hostnames every candidate IP is probed with.
+@Composable
+private fun EdgeScopeStrip(provider: String, probeDomains: String, onClear: () -> Unit) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "EDGE SCOPE",
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 2.sp,
+                    color = CyanAccent,
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    provider,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                if (probeDomains.isNotBlank()) {
+                    Text(
+                        "Probing $probeDomains",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            TextButton(onClick = onClear) { Text("Clear") }
+        }
+    }
 }
 
 private fun paste(ctx: Context, apply: (String) -> Unit) {

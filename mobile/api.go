@@ -470,6 +470,7 @@ func StartIPScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 	// inter-chunk pauses, and (for gentle/low-bandwidth modes) probing the
 	// endpoint's domains one-at-a-time (AdaptiveDomainConcurrency=1). The full
 	// probe-domain list is always used, so the same endpoints are found.
+	edgeDomains := edgeProbeDomains(cfg)
 	makeOpts := func() scanner.IPScanOptions {
 		o := scanner.IPScanOptions{
 			Ports:                  ports,
@@ -477,6 +478,9 @@ func StartIPScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 			Timeout:                timeout,
 			LowBandwidth:           lowBandwidth,
 			DisableAutoConcurrency: true,
+			ProbeDomainsHTTP:       edgeDomains,
+			ProbeDomainsHTTPS:      edgeDomains,
+			FastMode:               cfg.FastMode && !lowBandwidth && !liteMode,
 		}
 		if conc <= 25 || lowBandwidth || liteMode {
 			o.AdaptiveDomainConcurrency = 1
@@ -860,6 +864,9 @@ func StartSNIScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 	targets := splitTargets(cfg.Targets)
 	domains := splitTargets(cfg.SNIDomains)
 	if len(domains) == 0 {
+		domains = edgeProbeDomains(cfg)
+	}
+	if len(domains) == 0 {
 		domains = tlsprobe.GetDomains(dataDir)
 	}
 	ports := parsePortsCSV(cfg.Ports)
@@ -892,7 +899,7 @@ func StartSNIScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 			tlsprobe.RunScanContext(h.ctx, tlsprobe.ScanConfig{
 				Targets:     targets,
 				Hostnames:   domains,
-				Port:        ports[0],
+				Ports:       ports,
 				TimeoutSec:  timeout.Seconds(),
 				Concurrency: conc,
 				StrictSNI:   cfg.SNIStrict,
@@ -904,7 +911,7 @@ func StartSNIScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 		if expanded == 0 {
 			expanded = len(targets)
 		}
-		total := expanded * len(domains)
+		total := expanded * len(domains) * len(ports)
 		start := time.Now()
 		processed, hits := 0, 0
 
@@ -1090,8 +1097,8 @@ func runLiteSNIScan(dataDir string, cfg *ScanConfig, l ScanListener, h *ScanHand
 // artificially truncated.
 const maxSpeedRankIPs = 2000
 
-// StartSpeedRankScan benchmarks each target IP via the Cloudflare speed test
-// (with Google generate_204 and Cachefly as fallbacks) and ranks them by a
+// StartSpeedRankScan benchmarks each target IP with transfers pinned to that IP
+// and ranks them by a
 // composite of download/upload throughput, packet loss, and latency. Results
 // are written best-first to {dataDir}/results/scan-speedrank-*.txt and a CSV is
 // saved alongside. Mirrors the desktop TUI "Speed & Loss Rank" scan.
@@ -1138,12 +1145,13 @@ func StartSpeedRankScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHa
 		resultThrottle := newThrottle(250 * time.Millisecond)
 		start := time.Now()
 		total := len(ips)
-		l.OnLog(fmt.Sprintf("[SPEEDRANK] Benchmarking %d IP(s) via speed.cloudflare.com + fallbacks (port %d, concurrency %d)", total, port, conc))
+		l.OnLog(fmt.Sprintf("[SPEEDRANK] Benchmarking %d IP(s) against each candidate IP (port %d, concurrency %d)", total, port, conc))
 
 		opts := scanner.SpeedRankOptions{
 			Port:        port,
 			Concurrency: conc,
 			Timeout:     timeout,
+			SNI:         edgeSpeedSNI(cfg),
 			PauseFunc:   h.isPaused,
 		}
 		progressCb := func(processed, totalIPs, reachable int, currentIP string) {
