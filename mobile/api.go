@@ -959,9 +959,12 @@ func StartSNIScan(dataDir string, cfg *ScanConfig, l ScanListener) *ScanHandle {
 // ── Speed & Loss rank ────────────────────────────────────────────────────────
 
 func runLiteSNIScan(dataDir string, cfg *ScanConfig, l ScanListener, h *ScanHandle, targets, domains []string, ports []int, conc int, timeout time.Duration) {
+	// A chunk costs IPs x domains x ports probes, so the port count has to be in
+	// the divisor: sizing on domains alone makes a multi-port chunk that many
+	// times heavier than the budget Lite mode exists to hold.
 	chunkSize := liteChunkIPCount
-	if len(domains) > 0 {
-		chunkSize = liteChunkEndpointCount / len(domains)
+	if probesPerIP := len(domains) * len(ports); probesPerIP > 0 {
+		chunkSize = liteChunkEndpointCount / probesPerIP
 		if chunkSize < 1 {
 			chunkSize = 1
 		}
@@ -992,12 +995,12 @@ func runLiteSNIScan(dataDir string, cfg *ScanConfig, l ScanListener, h *ScanHand
 	rf, _ := openResultFile(dataDir, "sni")
 	logThrottle := newThrottle(250 * time.Millisecond)
 	resultThrottle := newThrottle(250 * time.Millisecond)
-	total := totalIPs * len(domains)
+	total := totalIPs * len(domains) * len(ports)
 	start := time.Now()
 	processed, hits := 0, 0
 
-	l.OnLog(fmt.Sprintf("[SNI-LITE-START] targets=%d staged_ips=%d domains=%d total_probes=%d concurrency=%d",
-		len(targets), totalIPs, len(domains), total, conc))
+	l.OnLog(fmt.Sprintf("[SNI-LITE-START] targets=%d staged_ips=%d domains=%d ports=%d total_probes=%d concurrency=%d",
+		len(targets), totalIPs, len(domains), len(ports), total, conc))
 
 	runChunk := func(chunk []string) {
 		if len(chunk) == 0 || h.isStopped() {
@@ -1008,7 +1011,7 @@ func runLiteSNIScan(dataDir string, cfg *ScanConfig, l ScanListener, h *ScanHand
 			tlsprobe.RunScanContext(h.ctx, tlsprobe.ScanConfig{
 				Targets:     chunk,
 				Hostnames:   domains,
-				Port:        ports[0],
+				Ports:       ports,
 				TimeoutSec:  timeout.Seconds(),
 				Concurrency: conc,
 				StrictSNI:   cfg.SNIStrict,

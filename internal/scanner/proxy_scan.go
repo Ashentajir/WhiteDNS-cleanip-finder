@@ -293,9 +293,7 @@ func (s *Scanner) scanProxyCandidates(candidates []string, concurrency int, time
 	// Lite HTTP and SOCKS5 use bounded worker verification.
 	protocol := proxyProtocolLabel(verifier)
 	s.logf("[DEBUG] scanProxyCandidates start (%s): total=%d concurrency=%d timeout=%s lite=%v\n", protocol, total, concurrency, timeout.String(), liteMode)
-	if s.proxyProgressCb != nil {
-		s.proxyProgressCb(0, total, 0, "", total)
-	}
+	s.reportProxyProgress(0, total, 0, "", total)
 	if concurrency > total {
 		concurrency = total
 	}
@@ -344,9 +342,7 @@ func (s *Scanner) scanProxyCandidates(candidates []string, concurrency int, time
 				processed := completed.Add(1)
 				if processed%50 == 0 || processed == int64(total) {
 					s.logf("[*] Verified %d/%d | Found %d\n", processed, total, hits.Load())
-					if s.proxyProgressCb != nil {
-						s.proxyProgressCb(int(processed), total, int(hits.Load()), "", total)
-					}
+					s.reportProxyProgress(int(processed), total, int(hits.Load()), "", total)
 				}
 			}
 		}()
@@ -372,9 +368,7 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, concurrency int,
 	if total == 0 {
 		return []ProxyScanResult{}
 	}
-	if s.proxyProgressCb != nil {
-		s.proxyProgressCb(0, total, 0, "", total)
-	}
+	s.reportProxyProgress(0, total, 0, "", total)
 
 	minInt := func(a, b int) int {
 		if a < b {
@@ -425,9 +419,7 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, concurrency int,
 			w3Pass.Load(), w3Done.Load(),
 			int(w3Pass.Load()),
 		)
-		if s.proxyProgressCb != nil {
-			s.proxyProgressCb(int(done), total, int(w3Pass.Load()), "", total)
-		}
+		s.reportProxyProgress(int(done), total, int(w3Pass.Load()), "", total)
 	}
 
 	for _, endpoint := range candidates {
@@ -511,9 +503,7 @@ func (s *Scanner) scanProxyCandidatesWave3(candidates []string, concurrency int,
 
 	wg.Wait()
 
-	if s.proxyProgressCb != nil {
-		s.proxyProgressCb(total, total, int(w3Pass.Load()), "", total)
-	}
+	s.reportProxyProgress(total, total, int(w3Pass.Load()), "", total)
 	s.logf("[DEBUG] Pipelined Wave3 complete: final verified=%d\n", len(verified))
 	return verified
 }

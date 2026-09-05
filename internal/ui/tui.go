@@ -3358,18 +3358,11 @@ func (m tuiModel) cmdScanWithConfig(targets []string, cfg scanConfig, scanKind s
 		cbCh := m.scanMsgCh
 		// set log callback and proxy progress callback (forward all logs, non-blocking)
 		m.app.Scanner.SetLogCallback(func(msg string) {
-			select {
-			case cbCh <- logMsg{msg}:
-			default:
-			}
+			trySendScanMsg(cbCh, logMsg{msg})
 		})
 		m.app.Scanner.SetProxyProgressCallback(func(processed, total, hits int, currentIP string, totalIPs int) {
 			// Map proxy progress into scanProgressMsg for the UI
-			msg := scanProgressMsg{current: processed, total: total, hits: hits, startTime: start, currentIP: currentIP, totalIPs: totalIPs}
-			select {
-			case cbCh <- msg:
-			default:
-			}
+			trySendScanMsg(cbCh, scanProgressMsg{current: processed, total: total, hits: hits, startTime: start, currentIP: currentIP, totalIPs: totalIPs})
 		})
 		// ensure callbacks are cleared
 		defer func() {
@@ -3473,10 +3466,7 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 				}
 
 				scannerInst.SetLogCallback(func(msg string) {
-					select {
-					case ch <- logMsg{text: msg}:
-					case <-time.After(50 * time.Millisecond):
-					}
+					sendScanMsg(ch, logMsg{text: msg})
 				})
 				defer scannerInst.SetLogCallback(nil)
 
@@ -3492,12 +3482,7 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 					if !shouldSend {
 						return
 					}
-					msg := scanProgressMsg{current: processed, total: totalProbes, hits: accepted, startTime: start, currentIP: currentIP, totalIPs: totalIPs}
-					select {
-					case ch <- msg:
-					case <-time.After(50 * time.Millisecond):
-						// drop if unable to send within 50ms to avoid blocking scanner
-					}
+					sendScanMsg(ch, scanProgressMsg{current: processed, total: totalProbes, hits: accepted, startTime: start, currentIP: currentIP, totalIPs: totalIPs})
 					lastSent = processed
 					lastAt = now
 				}
@@ -3688,6 +3673,30 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 	}
 }
 
+// sendScanMsg delivers a scanner callback message to the UI channel. It drops
+// the message rather than blocking the scanner, and survives the channel having
+// been closed by a scan that has already finished: the health monitor is stopped
+// by a context cancel that does not wait for its goroutine, so a log line can
+// still arrive after the close, and a bare send would panic the whole TUI.
+func sendScanMsg(ch chan tea.Msg, msg tea.Msg) {
+	defer func() { _ = recover() }() // send on closed channel
+	select {
+	case ch <- msg:
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// trySendScanMsg is sendScanMsg for callers that must never block the scanner:
+// the proxy waves run thousands of workers, so a full channel drops the message
+// instead of stalling each of them.
+func trySendScanMsg(ch chan tea.Msg, msg tea.Msg) {
+	defer func() { _ = recover() }() // send on closed channel
+	select {
+	case ch <- msg:
+	default:
+	}
+}
+
 func waitForScanMessage(ch <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		if ch == nil {
@@ -3744,25 +3753,13 @@ func (m tuiModel) cmdProxyScan(targets []string, cfg scanConfig, scanKind string
 				TransferModel: strings.TrimSpace(cfg.TransferModel),
 			}
 
-			// Forward logs to UI with short timeout to avoid blocking scanner
-			scannerInst.SetLogCallback(func(msg string) {
-				select {
-				case ch <- logMsg{text: msg}:
-				case <-time.After(50 * time.Millisecond):
-				}
-			})
-			defer scannerInst.SetLogCallback(nil)
-
 			start := time.Now()
 			lastSent := 0
 			lastAt := time.Time{}
 
-			// Set log callback (forward with timeout)
+			// Forward logs to the UI without blocking the scanner.
 			scannerInst.SetLogCallback(func(msg string) {
-				select {
-				case ch <- logMsg{msg}:
-				case <-time.After(50 * time.Millisecond):
-				}
+				sendScanMsg(ch, logMsg{text: msg})
 			})
 
 			// Set progress callback
@@ -3775,11 +3772,7 @@ func (m tuiModel) cmdProxyScan(targets []string, cfg scanConfig, scanKind string
 				if !shouldSend {
 					return
 				}
-				msg := scanProgressMsg{current: processed, total: total, hits: hits, startTime: start, currentIP: currentIP, totalIPs: totalIPs}
-				select {
-				case ch <- msg:
-				case <-time.After(50 * time.Millisecond):
-				}
+				sendScanMsg(ch, scanProgressMsg{current: processed, total: total, hits: hits, startTime: start, currentIP: currentIP, totalIPs: totalIPs})
 				lastSent = processed
 				lastAt = now
 			}

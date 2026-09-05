@@ -69,6 +69,12 @@ type Scanner struct {
 	// File logging for debugging
 	logFile      *os.File
 	logMutex     sync.Mutex
+	// cbMu guards logCb / proxyProgressCb. The UI sets them when a scan starts
+	// and clears them when it ends, while scan workers and the health monitor
+	// are still calling them — an unguarded func field is a data race, and the
+	// "check != nil then call" pattern can also observe a clear in between and
+	// call a nil func.
+	cbMu sync.RWMutex
 	logFileOwned bool
 	// performance helpers
 	dialer          *net.Dialer
@@ -78,12 +84,46 @@ type Scanner struct {
 
 // SetLogCallback registers a callback that receives scanner debug strings.
 func (s *Scanner) SetLogCallback(cb func(string)) {
+	if s == nil {
+		return
+	}
+	s.cbMu.Lock()
 	s.logCb = cb
+	s.cbMu.Unlock()
+}
+
+// logCallback returns the current log sink, or nil.
+func (s *Scanner) logCallback() func(string) {
+	if s == nil {
+		return nil
+	}
+	s.cbMu.RLock()
+	cb := s.logCb
+	s.cbMu.RUnlock()
+	return cb
 }
 
 // SetProxyProgressCallback registers a callback that receives proxy scan progress.
 func (s *Scanner) SetProxyProgressCallback(cb func(processed, total, hits int, currentIP string, totalIPs int)) {
+	if s == nil {
+		return
+	}
+	s.cbMu.Lock()
 	s.proxyProgressCb = cb
+	s.cbMu.Unlock()
+}
+
+// reportProxyProgress delivers a progress update to the current sink, if any.
+func (s *Scanner) reportProxyProgress(processed, total, hits int, currentIP string, totalIPs int) {
+	if s == nil {
+		return
+	}
+	s.cbMu.RLock()
+	cb := s.proxyProgressCb
+	s.cbMu.RUnlock()
+	if cb != nil {
+		cb(processed, total, hits, currentIP, totalIPs)
+	}
 }
 
 // InitFileLogging opens a log file for writing scanner diagnostics
@@ -166,8 +206,8 @@ func (s *Scanner) logf(format string, a ...interface{}) {
 	msg := fmt.Sprintf(format, a...)
 
 	// Forward to UI callback if present (no timestamp/prefix)
-	if s != nil && s.logCb != nil {
-		s.logCb(msg)
+	if cb := s.logCallback(); cb != nil {
+		cb(msg)
 	}
 
 	// Use global logger with component prefix; global logger writer will
