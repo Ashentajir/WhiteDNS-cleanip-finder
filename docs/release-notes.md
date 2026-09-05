@@ -1,19 +1,27 @@
-WhiteDNS v1.4.3 — a correction to how scoped scans judge a platform, and one identity domain restored.
+WhiteDNS v1.4.4 — a platform scope that means what it says, and the app domains that matter actually working.
 
-A small release on top of v1.4.2. Coming from v1.4.1, everything in the v1.4.2 notes applies as well.
+## Scoping a scan to a platform
 
-## Fixed
+**Pick a platform, bring your own targets.** Choosing Vercel now sets a scope rather than replacing what you are scanning. An ASN range, a pasted list or a file are all scanned against that platform, and the platform's own edge addresses become one target source among those rather than the only one. On the desktop the scan-mode screen names the active scope and the hostnames it will probe; on Android the scope survives swapping the targets, and the form says so.
 
-**A required platform domain now needs evidence about that name.** A scan scoped to an edge platform accepts an address only when one of the platform's own hostnames passes. That check previously counted a bare CDN signature header as a pass, which is not enough to conclude the platform is reachable through that address — the claim a scoped scan makes. It now takes a certificate covering the name, or the answer naming it.
+**A scoped scan probes that platform's hostnames, and only those.** It had been merging the standard IP-scan set in, so an ASN range you picked was still being asked about `workers.dev` and `pages.dev` — and addresses could pass on those, answering a question about Cloudflare rather than the platform you chose.
 
-Over TLS this rarely changes a verdict: an edge refuses the handshake outright for a name it does not front, so a completed handshake with a matching certificate was already real evidence. It matters on **port 80**, where there is no certificate to check and the signature header had been the whole basis.
+*Verified live:* `76.76.21.0/25` scoped to Vercel probes `vercel.app, vercel.com, react.dev, nextjs.org` and accepts 25 addresses. The same range scoped to Cloudflare or Netlify accepts none.
 
-**`railway.app` is back among Railway's identity domains.** v1.4.2 dropped it on the reasoning that a name resolving into Cloudflare identifies Cloudflare rather than Railway. That was backwards. Railway fronts through Cloudflare, so a Cloudflare address holding a valid certificate for `railway.app` is a working way in — exactly what the scan is looking for. Dropping it made Railway scans worse.
+## The app domains now work
 
-**The v1.4.2 notes carried the same mistake** and have been corrected in place.
+`netlify.app`, `pages.dev`, `fly.dev`, `vercel.app`, `workers.dev` — the wildcard suffixes your apps actually live on — could never confirm anything. There is no site at the apex of a wildcard suffix, so an edge serving every app on the platform answers a probe with 404, 530 or nothing at all, and the probe gave up before looking at the certificate already on the table.
 
-## What to expect from a scoped scan
+A scoped scan now settles the platform question the moment the TLS handshake completes. An edge refuses the handshake outright for a suffix it does not front, so holding a certificate for the name is the evidence, and no page needs to come back.
 
-Render, Railway and Koyeb all front through Cloudflare, so scoping a scan to one of them returns Cloudflare addresses holding a valid certificate for that platform's names. Keep them — they are working ways in, not stray matches. Verified against a live Cloudflare edge, which serves `render.com`, `onrender.com`, `railway.app`, `koyeb.app` and `react.dev`, and refuses the handshake for `vercel.com`, `vercel.app`, `fly.dev` and `nextjs.org`. That refusal is what gives the platform requirement its teeth.
+This applies to scoped scans only. A plain IP scan keeps its own accept rules, so it does not become "any TLS host with a valid certificate passes".
+
+*Verified live:* an address holding a certificate for `onrender.com` that returns no page is rejected by an unscoped scan and accepted when scoped to Render.
+
+## Target quality
+
+**A stale seed hostname no longer drags a stranger's network into a scan.** One name in Cloudflare's seed list now resolves to a parked host on an unrelated network, and target-building widened it to a /24 that was then scanned as if it were Cloudflare. A platform that publishes its ranges tells us where its edge is, so answers from outside them are dropped; platforms that publish nothing are still mapped entirely from DNS.
+
+Every platform's scope hostnames were checked against that platform's own edge for a certificate covering each name.
 
 Desktop binaries, Android APKs/AAB, and SHA-256 checksums are attached below.
