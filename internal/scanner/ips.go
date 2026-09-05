@@ -1139,6 +1139,10 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 	type domainOutcome struct {
 		result   *IPScanResult
 		accepted bool
+		// strong marks an accept backed by evidence about this domain in
+		// particular — a certificate covering it, or the answer naming it — as
+		// opposed to a CDN edge answering whatever it was asked.
+		strong bool
 	}
 
 	// Domain probes share a cancellable context so a fast scan can drop the
@@ -1204,7 +1208,11 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 			result.StatusCode = resp.StatusCode
 			result.Status = classifyResponse(resp.StatusCode, body, resp.Header, domain)
 			if result.Status == "accept" {
-				return domainOutcome{result: result, accepted: true}
+				return domainOutcome{
+					result:   result,
+					accepted: true,
+					strong:   responseMentionsDomain(body, resp.Header, domain),
+				}
 			}
 			// Python parity: soft_accept is finalized immediately (never retried).
 			if result.Status == "soft_accept" {
@@ -1252,19 +1260,23 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 	result := &IPScanResult{IP: ip, Port: port, DomainTotal: len(domains), DomainsTested: len(domains), PassedDomains: []string{}}
 	domainScore := 0
 	acceptThreshold := minimumDomainAcceptScore(len(domains))
+	var strongDomains []string
 	var bestResult *IPScanResult
 	for outcome := range outcomes {
 		if outcome.accepted {
 			domainScore++
 			if outcome.result != nil {
 				result.PassedDomains = append(result.PassedDomains, outcome.result.Domain)
+				if outcome.strong {
+					strongDomains = append(strongDomains, outcome.result.Domain)
+				}
 			}
 			if bestResult == nil || bestResult.Status != "accept" || outcome.result.Status == "accept" {
 				copyResult := *outcome.result
 				bestResult = &copyResult
 			}
 			if opts.FastMode && domainScore >= acceptThreshold &&
-				meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+				meetsRequiredDomains(strongDomains, opts.RequiredProbeDomains) {
 				// Verdict reached; the remaining domains cannot change it. The
 				// required set has to be satisfied first, or stopping here would
 				// reject an endpoint whose platform domain was never probed.
@@ -1290,10 +1302,11 @@ func (s *Scanner) probeHTTP(ctx context.Context, ip string, port int, opts IPSca
 				bestResult.Error = fmt.Sprintf("insufficient domain confirmations: %d/%d", domainScore, acceptThreshold)
 			}
 			s.vlogf("[NOISE] %s:%d only %d/%d domains confirmed; rejecting to avoid ISP noise\n", ip, port, domainScore, acceptThreshold)
-		} else if !meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+		} else if !meetsRequiredDomains(strongDomains, opts.RequiredProbeDomains) {
 			bestResult.Status = "reject"
-			bestResult.Error = "no required domain confirmed: " + strings.Join(opts.RequiredProbeDomains, ",")
-			s.vlogf("[SCOPE] %s:%d passed %v but none of the required domains; rejecting\n", ip, port, result.PassedDomains)
+			bestResult.Error = "no required domain served by this host: " + strings.Join(opts.RequiredProbeDomains, ",")
+			s.vlogf("[SCOPE] %s:%d passed %v (evidence for %v); no required domain is actually hosted here, rejecting\n",
+				ip, port, result.PassedDomains, strongDomains)
 		}
 		s.vlogf("[SCORE] %s:%d domains %d/%d passed:[%s]\n", ip, port, domainScore, len(domains), strings.Join(result.PassedDomains, ","))
 		return bestResult
@@ -1318,6 +1331,24 @@ func meetsRequiredDomains(passed, required []string) bool {
 	}
 	for _, d := range passed {
 		if _, ok := want[normalizedDomain(d)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// responseMentionsDomain reports whether a response actually refers to the
+// domain that was asked for, rather than merely coming from a CDN that answered
+// on that address. classifyResponse accepts a CDN signature on its own, which is
+// right for finding a usable edge; it is not enough on its own to conclude that
+// a particular platform is reachable through this address, which is what a
+// scoped scan claims. Over TLS the certificate settles it — an edge refuses the
+// handshake for a name it does not front — but a probe on port 80 has no
+// certificate to check, and there this is the only evidence there is.
+func responseMentionsDomain(body []byte, headers http.Header, domain string) bool {
+	respLower := buildHeadersLower(headers) + "\r\n" + strings.ToLower(string(body))
+	for _, tok := range cachedDomainTokens(domain) {
+		if strings.Contains(respLower, tok) {
 			return true
 		}
 	}
@@ -1395,6 +1426,10 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 	type domainOutcome struct {
 		result   *IPScanResult
 		accepted bool
+		// strong marks an accept backed by evidence about this domain in
+		// particular — a certificate covering it, or the answer naming it — as
+		// opposed to a CDN edge answering whatever it was asked.
+		strong bool
 	}
 
 	// Domain probes share a cancellable context so a fast scan can drop the
@@ -1507,9 +1542,14 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 					result.Status = "accept"
 				}
 			}
+			certOK := certMatchesDomain(state, domain)
 			tlsConn.Close()
 			if result.Status == "accept" {
-				return domainOutcome{result: result, accepted: true}
+				return domainOutcome{
+					result:   result,
+					accepted: true,
+					strong:   certOK || responseMentionsDomain(body, headers, domain),
+				}
 			}
 			// Python parity: soft_accept is finalized immediately (never retried).
 			// Python adds soft_accept domains to soft_domains without retry.
@@ -1557,18 +1597,22 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 
 	result := &IPScanResult{IP: ip, Port: port, DomainTotal: len(domains), DomainsTested: len(domains), PassedDomains: []string{}}
 	domainScore := 0
+	var strongDomains []string
 	var bestResult *IPScanResult
 	for outcome := range outcomes {
 		if outcome.accepted {
 			domainScore++
 			if outcome.result != nil {
 				result.PassedDomains = append(result.PassedDomains, outcome.result.Domain)
+				if outcome.strong {
+					strongDomains = append(strongDomains, outcome.result.Domain)
+				}
 			}
 			if outcome.result != nil && (bestResult == nil || bestResult.Status != "accept" || outcome.result.Status == "accept") {
 				copyResult := *outcome.result
 				bestResult = &copyResult
 			}
-			if opts.FastMode && meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+			if opts.FastMode && meetsRequiredDomains(strongDomains, opts.RequiredProbeDomains) {
 				// One confirmation is this path's accept rule; stop the rest once
 				// the required set (if any) has actually been satisfied.
 				cancelProbes()
@@ -1587,10 +1631,11 @@ func (s *Scanner) probeHTTPS(ctx context.Context, ip string, port int, opts IPSc
 		bestResult.DomainTotal = len(domains)
 		bestResult.DomainsTested = len(domains)
 		bestResult.PassedDomains = result.PassedDomains
-		if !meetsRequiredDomains(result.PassedDomains, opts.RequiredProbeDomains) {
+		if !meetsRequiredDomains(strongDomains, opts.RequiredProbeDomains) {
 			bestResult.Status = "reject"
-			bestResult.Error = "no required domain confirmed: " + strings.Join(opts.RequiredProbeDomains, ",")
-			s.vlogf("[SCOPE] %s:%d passed %v but none of the required domains; rejecting\n", ip, port, result.PassedDomains)
+			bestResult.Error = "no required domain served by this host: " + strings.Join(opts.RequiredProbeDomains, ",")
+			s.vlogf("[SCOPE] %s:%d passed %v (evidence for %v); no required domain is actually hosted here, rejecting\n",
+				ip, port, result.PassedDomains, strongDomains)
 		}
 		s.vlogf("[SCORE] %s:%d domains %d/%d passed:[%s]\n", ip, port, domainScore, len(domains), strings.Join(result.PassedDomains, ","))
 		return bestResult
