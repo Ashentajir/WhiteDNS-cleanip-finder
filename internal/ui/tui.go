@@ -1181,17 +1181,26 @@ func (m tuiModel) viewList(w, h int, title string, items []string, help string) 
 
 func (m tuiModel) viewScanMode(w, h int) string {
 	label := strings.ToUpper(m.scanKind)
+	scopeItem := "[edge] 🌐 Scope to a platform (Cloudflare / Vercel / Fly.io / …)"
+	ownIPs := "[edge-ips] 📡 Use the platform's own edge IPs  (pick a platform first)"
+	help := "↑↓ navigate  ·  Enter select  ·  Esc back"
+	if p := config.GetEdgeProvider(m.scanConfig.EdgeProvider); p != nil {
+		scopeItem = "[edge] 🌐 Scope: " + p.Name + "  (Enter to change)"
+		ownIPs = "[edge-ips] 📡 Use " + p.Name + " edge IPs as targets"
+		help = "Probing " + strings.Join(p.ProbeDomains, ", ") + "  ·  Esc back"
+	}
 	items := []string{
 		"[list] 🔍 Select from IranASN file",
 		"[paste] 📋 Paste targets (IPs/CIDRs)",
 		"[type] ⌨️ Type targets manually",
 		"[file] 📄 Import targets from .txt file",
-		"[edge] 🌐 Edge provider (Cloudflare / Vercel / Fly.io / …)",
+		scopeItem,
+		ownIPs,
 	}
 	return m.viewList(w, h,
 		fmt.Sprintf("SCAN MODE - %s", label),
 		items,
-		"↑↓ navigate  ·  Enter select  ·  Esc back",
+		help,
 	)
 }
 
@@ -2165,11 +2174,10 @@ func (m tuiModel) handleScanModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 			m.cursor--
 		}
 	case "down", "j":
-		if m.cursor < 4 {
+		if m.cursor < 5 {
 			m.cursor++
 		}
 	case "enter":
-		m.scanConfig.EdgeProvider = ""
 		switch m.cursor {
 		case 0:
 			m.scanConfig.Mode = "asn"
@@ -2189,6 +2197,16 @@ func (m tuiModel) handleScanModeScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 		case 4:
 			m.scanConfig.Mode = "edge"
 			m.pushScreen(screenEdgeProvider)
+		case 5:
+			p := config.GetEdgeProvider(m.scanConfig.EdgeProvider)
+			if p == nil {
+				m.setToast(sError.Render("x Choose a platform first"), 3*time.Second)
+				return m, nil
+			}
+			m.scanConfig.Mode = "edge"
+			m.edgeMining = true
+			m.addLog(fmt.Sprintf("Resolving %d seed host(s) for %s", len(p.Hosts), p.Name))
+			return m, cmdMineEdgeProvider(*p)
 		}
 	}
 	return m, nil
@@ -2252,9 +2270,13 @@ func (m tuiModel) handleEdgeProviderScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 	case "enter":
 		p := config.EdgeProviders[m.cursor]
 		m.scanConfig.EdgeProvider = p.Name
-		m.edgeMining = true
-		m.addLog(fmt.Sprintf("Edge provider: %s (resolving %d seed host(s))", p.Name, len(p.Hosts)))
-		return m, cmdMineEdgeProvider(p)
+		m.addLog(fmt.Sprintf("Scope: %s — probing %s", p.Name, strings.Join(p.ProbeDomains, ", ")))
+		m.setToast(sSuccess.Render("OK Scope: "+p.Name), 4*time.Second)
+		// Scope set; the user now picks what to scan with it.
+		m.screen = screenScanMode
+		m.prevScreen = screenMenu
+		m.cursor = 0
+		return m, nil
 	}
 	return m, nil
 }
@@ -2263,10 +2285,10 @@ func (m tuiModel) handleEdgeProviderScreen(msg tea.Msg) (tuiModel, tea.Cmd) {
 // to the normal review -> ports -> scan flow.
 func (m tuiModel) handleEdgeMined(msg edgeMinedMsg) (tuiModel, tea.Cmd) {
 	m.edgeMining = false
-	if m.screen != screenEdgeProvider {
+	if m.screen != screenScanMode && m.screen != screenEdgeProvider {
 		// User navigated away while the lookups were in flight; drop the result
-		// instead of hijacking whatever screen they are on now.
-		m.scanConfig.EdgeProvider = ""
+		// instead of hijacking whatever screen they are on now. The scope stays:
+		// it is a separate choice from where the targets came from.
 		return m, nil
 	}
 	if msg.err != nil {
@@ -3443,19 +3465,12 @@ func (m tuiModel) cmdPoolOperation(opType string, asnNetworks []string) tea.Cmd 
 				if cfg.LowBandwidth {
 					opts.AdaptiveDomainConcurrency = 1
 				}
-				// An edge provider selection probes that platform's hostnames
-				// alongside the standard set, and requires one of the platform's
-				// to pass — so an accepted IP is one that really serves it, judged
-				// by the same evidence a plain IP scan collects.
+				// A platform scope replaces the probe hostnames with that
+				// platform's own, whatever the targets are: pick Vercel and every
+				// address selected — an ASN range, a pasted list, the platform's
+				// own edge IPs — is asked whether it serves Vercel.
 				if p := config.GetEdgeProvider(cfg.EdgeProvider); p != nil && len(p.ProbeDomains) > 0 {
-					// The standard set is whichever one this scan would have used
-					// on its own: the IP scan's probe domains, or the SNI
-					// scanner's TLS hostname list.
-					standard := scanner.DefaultProbeDomains()
-					if opType == "sni_scanner" || opType == "desync_scanner" {
-						standard = tlsprobe.GetDomains(m.app.DataDir)
-					}
-					domains := p.ScanDomains(standard)
+					domains := p.ScanDomains()
 					opts.ProbeDomainsHTTP = domains
 					opts.ProbeDomainsHTTPS = append([]string(nil), domains...)
 					opts.RequiredProbeDomains = p.RequiredScanDomains()

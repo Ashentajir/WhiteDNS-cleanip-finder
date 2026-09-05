@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"whitedns-go/internal/config"
-	"whitedns-go/internal/scanner"
 )
 
 // EdgeProviderList returns the selectable edge platforms, one per line:
@@ -40,15 +39,15 @@ func EdgeProviderTargets(name string) (string, error) {
 }
 
 // edgeProbeDomains returns the hostnames a scan scoped to the config's edge
-// provider should probe: the platform's own names plus the standard set, so an
-// accepted IP is judged on the same evidence a plain IP scan collects. Returns
-// nil when no platform is selected.
+// platform probes — that platform's own, and nothing else, so the answer is
+// about the platform the user picked. Returns nil when none is selected, which
+// leaves the standard IP-scan probe set in place.
 func edgeProbeDomains(cfg *ScanConfig) []string {
 	p := selectedEdgeProvider(cfg)
 	if p == nil {
 		return nil
 	}
-	return p.ScanDomains(defaultScanDomains())
+	return p.ScanDomains()
 }
 
 // edgeRequiredDomains returns the names at least one of which an endpoint must
@@ -67,10 +66,6 @@ func selectedEdgeProvider(cfg *ScanConfig) *config.EdgeProvider {
 	}
 	return config.GetEdgeProvider(strings.TrimSpace(cfg.EdgeProvider))
 }
-
-// defaultScanDomains is the standard probe set a plain IP scan uses, so a
-// scoped scan collects the same evidence on top of the platform check.
-func defaultScanDomains() []string { return scanner.DefaultProbeDomains() }
 
 // edgeSpeedSNI returns the hostname the speed test should present when a
 // platform is selected, so the pinned transfer reaches that edge rather than

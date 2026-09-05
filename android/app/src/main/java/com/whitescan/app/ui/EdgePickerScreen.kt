@@ -77,7 +77,7 @@ fun EdgePickerScreen(
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                "An IP counts as a hit only when it answers for the platform itself — the standard probe domains are checked too, but they cannot stand in for it.",
+                "The platform stays selected if you swap the targets afterwards — pick an ASN and those addresses get asked whether they serve this platform, and nothing else.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

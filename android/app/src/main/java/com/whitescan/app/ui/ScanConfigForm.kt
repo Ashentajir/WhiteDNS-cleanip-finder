@@ -808,7 +808,7 @@ private fun EdgeScopeStrip(provider: String, probeDomains: String, onClear: () -
                 )
                 if (probeDomains.isNotBlank()) {
                     Text(
-                        "Probing $probeDomains",
+                        "Every target is probed with $probeDomains",
                         fontFamily = FontFamily.Monospace,
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

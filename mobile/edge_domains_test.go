@@ -4,50 +4,50 @@ import (
 	"strings"
 	"testing"
 
-	"whitedns-go/internal/scanner"
+	"whitedns-go/internal/config"
 )
 
-// An edge scan has to collect the same evidence a plain IP scan does, so the
-// standard probe domains must all be present alongside the platform's own.
-// This caught the list being wired to the SNI scanner's TLS hostnames instead.
-func TestEdgeScanKeepsTheIPScanDomains(t *testing.T) {
+// Picking a platform means asking every candidate address whether it serves
+// that platform. Folding in the standard probe set would answer a different
+// question and hand back addresses that passed on Cloudflare's or Google's
+// names instead of the one the user chose.
+func TestScopedScanProbesOnlyTheChosenPlatform(t *testing.T) {
 	cfg := &ScanConfig{EdgeProvider: "Vercel (vercel.app)"}
 	got := edgeProbeDomains(cfg)
 	if len(got) == 0 {
-		t.Fatal("no probe domains for a selected provider")
-	}
-	index := map[string]int{}
-	for i, d := range got {
-		index[strings.ToLower(d)] = i
+		t.Fatal("no probe domains for a selected platform")
 	}
 
-	for _, want := range scanner.DefaultProbeDomains() {
-		if _, ok := index[strings.ToLower(want)]; !ok {
-			t.Errorf("standard IP-scan domain %q missing from the edge scan: %v", want, got)
+	want := config.GetEdgeProvider("Vercel (vercel.app)").ProbeDomains
+	if len(got) != len(want) {
+		t.Fatalf("scoped scan probes %v, want exactly %v", got, want)
+	}
+
+	// The names that used to leak in from the standard set.
+	for _, foreign := range []string{"workers.dev", "pages.dev", "gemini.google.com", "chatgpt.com"} {
+		for _, d := range got {
+			if strings.EqualFold(d, foreign) {
+				t.Errorf("a Vercel scan is probing %q, which belongs to another platform", foreign)
+			}
 		}
 	}
 
+	// Every probed name must be one a hit can be credited to.
 	required := edgeRequiredDomains(cfg)
-	if len(required) == 0 {
-		t.Fatal("a scoped scan must require the platform's own domains")
-	}
-	for _, want := range required {
-		pos, ok := index[strings.ToLower(want)]
-		if !ok {
-			t.Errorf("required domain %q is not probed at all", want)
-			continue
+	for _, d := range got {
+		found := false
+		for _, r := range required {
+			if strings.EqualFold(d, r) {
+				found = true
+				break
+			}
 		}
-		// Required names go first so a fast scan confirms the deciding one
-		// before it stops.
-		if pos >= len(scanner.DefaultProbeDomains()) && pos >= len(required) {
-			continue
-		}
-		if pos >= len(required) {
-			t.Errorf("required domain %q should sort before the standard set, got position %d", want, pos)
+		if !found {
+			t.Errorf("%q is probed but cannot credit a hit", d)
 		}
 	}
 
 	if edgeProbeDomains(&ScanConfig{}) != nil {
-		t.Error("no provider selected should leave the probe list alone")
+		t.Error("no platform selected should leave the standard probe set in place")
 	}
 }

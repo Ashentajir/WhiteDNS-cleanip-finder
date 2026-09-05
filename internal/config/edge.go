@@ -151,30 +151,24 @@ func LocalIPv6Usable() bool {
 	return true
 }
 
-// ScanDomains returns the hostnames a scan scoped to this provider should probe:
-// the platform's own names first, then the standard set the plain IP scan uses.
-// Both matter and they answer different questions — the platform names say the
-// IP is that platform's edge, the standard names say it carries real traffic to
-// the services people are trying to reach — so a scoped scan asks both and
-// requires the first (see RequiredScanDomains).
-//
-// The platform names come first so a fast scan confirms the one that decides the
-// verdict before it stops.
-func (p EdgeProvider) ScanDomains(standard []string) []string {
+// ScanDomains returns the hostnames a scan scoped to this platform probes —
+// the platform's own, and nothing else. Picking Vercel means asking every
+// candidate address whether it serves Vercel; folding in the standard set would
+// answer a different question (does this address serve Cloudflare Workers, or
+// Google) and hand back addresses that pass on those instead.
+func (p EdgeProvider) ScanDomains() []string {
 	seen := make(map[string]struct{})
 	var out []string
-	for _, group := range [][]string{p.ProbeDomains, standard} {
-		for _, d := range group {
-			d = strings.ToLower(strings.TrimSpace(d))
-			if d == "" {
-				continue
-			}
-			if _, ok := seen[d]; ok {
-				continue
-			}
-			seen[d] = struct{}{}
-			out = append(out, d)
+	for _, d := range p.ProbeDomains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" {
+			continue
 		}
+		if _, ok := seen[d]; ok {
+			continue
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
 	}
 	return out
 }
