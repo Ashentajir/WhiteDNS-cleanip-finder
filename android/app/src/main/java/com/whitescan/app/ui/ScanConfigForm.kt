@@ -181,10 +181,13 @@ fun ScanConfigForm(
                         placeholder = { Text("1.2.3.0/24\n5.6.7.8") },
                     )
                     Spacer(Modifier.height(10.dp))
-                    FilledTonalButton(
+                    Button(
                         onClick = onPickASN,
-                        shape = MaterialTheme.shapes.small,
                         modifier = Modifier.fillMaxWidth().height(50.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Lavender,
+                            contentColor = androidx.compose.ui.graphics.Color(0xFF1A0050),
+                        ),
                     ) {
                         Icon(Icons.Default.Dns, contentDescription = null, modifier = Modifier.size(20.dp))
                         Spacer(Modifier.width(8.dp))
@@ -193,7 +196,6 @@ fun ScanConfigForm(
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
                         onClick = onPickEdge,
-                        shape = MaterialTheme.shapes.small,
                         modifier = Modifier.fillMaxWidth().height(50.dp),
                     ) {
                         Icon(Icons.Default.CloudQueue, contentDescription = null,
@@ -627,15 +629,14 @@ fun ScanConfigForm(
     }
 }
 
-// A section's rail says what kind of setting it holds: signal for what gets
-// scanned, caution for the knobs that spend battery, radio and exposure. What
-// runs afterwards is not a state, so it takes the neutral ramp rather than a
-// third colour invented to tell sections apart — that is what turns a palette
-// into decoration. The rail is the same device the edge picker uses, so the
-// two screens read as one instrument.
-private val SectionScan = Signal
-private val SectionCost = Caution
-private val SectionAfter = TextFaint
+// A section's accent says what kind of setting it holds, not just where one
+// group ends and the next begins: cyan for what gets scanned, amber for the
+// knobs that spend battery, radio and exposure, lavender for what runs
+// afterwards. The rail carrying that colour is the same device the edge picker
+// uses, so the two screens read as one instrument.
+private val SectionScan = CyanAccent
+private val SectionCost = Amber
+private val SectionAfter = Lavender
 
 // One group of settings. The header carries the section's current value on the
 // right, so scrolling the form reads back the whole configuration without
@@ -648,8 +649,8 @@ private fun FormSection(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Surface(
-        color = Panel,
-        shape = MaterialTheme.shapes.small,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = MaterialTheme.shapes.medium,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(Modifier.height(IntrinsicSize.Min)) {

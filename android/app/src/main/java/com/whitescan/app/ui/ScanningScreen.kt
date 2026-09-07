@@ -13,9 +13,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -30,11 +30,8 @@ fun ScanningScreen(
 ) {
     val logListState = rememberLazyListState()
 
-    // Auto-scroll log to newest entry. Keyed on the newest line, not the list
-    // size: the buffer is capped at 50 lines, so once it fills, size stops
-    // changing and a size-keyed effect would never fire again — freezing the
-    // log exactly during the long scans where it matters most.
-    LaunchedEffect(state.logs.lastOrNull()) {
+    // Auto-scroll log to newest entry
+    LaunchedEffect(state.logs.size) {
         if (state.logs.isNotEmpty()) {
             logListState.animateScrollToItem(state.logs.lastIndex)
         }
@@ -47,122 +44,110 @@ fun ScanningScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
 
-        // ── Progress ───────────────────────────────────────────────────────
-        // One signal colour on a recessed track. The old five-stop rainbow was
-        // decoration: the hue carried no information, it just changed along the
-        // bar, which is exactly what made the screen look generic.
+        // ── Progress bar (cyan → green → orange gradient) ──────────────────
         val pct = if (state.total > 0) state.processed.toFloat() / state.total else 0f
-        Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Text(
-                    "${(pct * 100).toInt()}",
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 30.sp,
-                    color = TextPrimary,
+                    "${(pct * 100).toInt()}%  ${state.processed}/${state.total}",
+                    style = MaterialTheme.typography.bodySmall,
                 )
-                Text(
-                    "%",
-                    style = MonoData,
-                    color = TextDim,
-                    modifier = Modifier.padding(start = 2.dp, bottom = 5.dp),
-                )
-                Spacer(Modifier.weight(1f))
-                Column(horizontalAlignment = Alignment.End) {
-                    Text("SCANNED", style = MonoLabel, color = TextFaint)
-                    Spacer(Modifier.height(2.dp))
-                    Text("${state.processed} / ${state.total}", style = MonoData, color = TextPrimary)
+                if (state.etaSec > 0) {
+                    val m = state.etaSec / 60; val s = state.etaSec % 60
+                    Text("ETA ${m}m${s}s", style = MaterialTheme.typography.bodySmall)
                 }
             }
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(4.dp)
-                    .background(Inset),
+                    .height(8.dp)
+                    .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.small),
             ) {
                 if (pct > 0f) {
                     Box(
                         modifier = Modifier
-                            .fillMaxWidth(pct.coerceIn(0f, 1f))
+                            .fillMaxWidth(pct)
                             .fillMaxHeight()
-                            .background(Signal),
+                            .background(
+                                Brush.horizontalGradient(
+                                    // TUI gradient stops: #00d1ff → #7fff00 → #ffb400 → #ff4081 → #8a2be2
+                                    listOf(
+                                        Color(0xFF00D1FF),
+                                        Color(0xFF7FFF00),
+                                        Color(0xFFFFB400),
+                                        Color(0xFFFF4081),
+                                        Color(0xFF8A2BE2),
+                                    )
+                                ),
+                                MaterialTheme.shapes.small,
+                            ),
                     )
                 }
             }
         }
 
-        // ── Readouts ───────────────────────────────────────────────────────
+        // ── Stats row ──────────────────────────────────────────────────────
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(1.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Readout("FOUND", state.found.toString(), if (state.found > 0) Pass else TextPrimary, Modifier.weight(1f))
-            Readout("UNIQUE IPS", state.uniqueIPs.toString(), TextPrimary, Modifier.weight(1f))
-            Readout(
-                "ETA",
-                if (state.etaSec > 0) "${state.etaSec / 60}m ${state.etaSec % 60}s" else "--",
-                TextPrimary,
-                Modifier.weight(1f),
-            )
+            Text("Found: ${state.found}", style = MaterialTheme.typography.bodySmall)
+            Text("Unique IPs: ${state.uniqueIPs}", style = MaterialTheme.typography.bodySmall)
         }
 
         // ── Current target ─────────────────────────────────────────────────
         if (state.currentIP.isNotEmpty()) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Text("PROBING", style = MonoLabel, color = TextFaint)
+            Text(
+                "▶ ${state.currentIP}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        // ── Live hits (last 6) ─────────────────────────────────────────────
+        if (state.liveResults.isNotEmpty()) {
+            HorizontalDivider()
+            Text(
+                "Recent hits  (${state.found} total)",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            state.liveResults.takeLast(6).forEach { line ->
                 Text(
-                    state.currentIP,
-                    style = MonoData,
-                    color = Signal,
+                    "✓ $line",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MintGreen,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
         }
 
-        // ── Live hits (last 6) ─────────────────────────────────────────────
-        if (state.liveResults.isNotEmpty()) {
-            SectionRule("Recent hits", state.found.toString())
-            state.liveResults.takeLast(6).forEach { line ->
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Box(Modifier.size(4.dp).background(Pass))
-                    Text(
-                        line,
-                        style = MonoData,
-                        color = Pass,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-        }
-
         // ── Log tail ───────────────────────────────────────────────────────
-        SectionRule("Log", "")
+        HorizontalDivider()
+        Text("Log", style = MaterialTheme.typography.labelMedium)
         LazyColumn(
             state = logListState,
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .background(Inset, MaterialTheme.shapes.extraSmall)
-                .padding(horizontal = 9.dp, vertical = 7.dp),
+                .background(
+                    MaterialTheme.colorScheme.surfaceVariant,
+                    MaterialTheme.shapes.small,
+                )
+                .padding(6.dp),
         ) {
             items(state.logs) { line ->
                 Text(
                     line,
-                    fontFamily = FontFamily.Monospace,
                     fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
                     lineHeight = 14.sp,
-                    color = TextDim,
                     softWrap = false,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -176,7 +161,6 @@ fun ScanningScreen(
         ) {
             OutlinedButton(
                 onClick = onPauseResume,
-                shape = MaterialTheme.shapes.small,
                 modifier = Modifier.weight(1f).height(48.dp),
             ) {
                 Icon(
@@ -189,7 +173,6 @@ fun ScanningScreen(
             }
             Button(
                 onClick = onStop,
-                shape = MaterialTheme.shapes.small,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,
                 ),
@@ -208,39 +191,10 @@ fun ScanningScreen(
         if (state.done) {
             Button(
                 onClick = onViewResults,
-                shape = MaterialTheme.shapes.small,
                 modifier = Modifier.fillMaxWidth().height(52.dp),
             ) {
                 Text("View Results (${state.found})")
             }
         }
-    }
-}
-
-/** One labelled value on the instrument face. */
-@Composable
-private fun Readout(label: String, value: String, valueColor: Color, modifier: Modifier = Modifier) {
-    Column(
-        modifier = modifier
-            .background(Panel)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-    ) {
-        Text(label, style = MonoLabel, color = TextFaint)
-        Spacer(Modifier.height(3.dp))
-        Text(value, style = MonoData, fontWeight = FontWeight.Bold, color = valueColor)
-    }
-}
-
-/** Section head: a tracked label, a hairline, and an optional count. */
-@Composable
-private fun SectionRule(label: String, count: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Text(label.uppercase(), style = MonoLabel, color = TextDim)
-        Box(Modifier.weight(1f).height(1.dp).background(Rule))
-        if (count.isNotEmpty()) Text(count, style = MonoData, color = TextDim)
     }
 }

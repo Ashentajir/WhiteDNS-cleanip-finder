@@ -52,12 +52,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    // buildConfig exposes versionName to the UI, so the banner cannot drift
-    // out of step with the declared version the way a hardcoded string did.
-    buildFeatures {
-        compose = true
-        buildConfig = true
-    }
+    buildFeatures { compose = true }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }
