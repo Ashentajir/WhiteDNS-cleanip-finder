@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"unicode/utf8"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,5 +224,22 @@ func TestConfigMakerDisplayLabel(t *testing.T) {
 	got := configMakerDisplayLabel(long, 20)
 	if len(got) != 20 {
 		t.Errorf("expected truncated label of length 20, got %d (%q)", len(got), got)
+	}
+
+	// A multi-line WireGuard block must collapse to one line, or the review
+	// list shifts every row below it.
+	wg := "[Interface]\nPrivateKey = k\nJc = 4\n\n[Peer]\nEndpoint = 203.0.113.7:51820"
+	label := configMakerDisplayLabel(wg, 100)
+	if strings.ContainsAny(label, "\r\n") {
+		t.Errorf("WireGuard label spans lines: %q", label)
+	}
+	if label != "AmneziaWG -> 203.0.113.7:51820" {
+		t.Errorf("WireGuard label = %q", label)
+	}
+
+	// Truncation must not split a multi-byte character.
+	persian := "vless://uuid@1.2.3.4:443#" + strings.Repeat("\u0633", 40)
+	if trimmed := configMakerDisplayLabel(persian, 20); !utf8.ValidString(trimmed) {
+		t.Errorf("truncation produced invalid UTF-8: %q", trimmed)
 	}
 }

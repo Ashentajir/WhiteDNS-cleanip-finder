@@ -62,3 +62,6 @@ internal/ui/sni_crash_test.go
 !internal/bundledata/embedded/
 !internal/bundledata/embedded/**
 android/app/libs/
+# Gradle build output
+android/app/build/
+android/build/

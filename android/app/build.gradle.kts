@@ -3,8 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val appVersionCode = 14
-val appVersionName = "1.4.4"
+val appVersionCode = 15
+val appVersionName = "1.4.5"
 
 android {
     namespace = "com.whitescan.app"
@@ -52,7 +52,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    // buildConfig exposes versionName to the UI, so the banner cannot drift
+    // out of step with the declared version the way a hardcoded string did.
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }

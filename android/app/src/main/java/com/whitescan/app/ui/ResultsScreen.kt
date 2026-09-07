@@ -52,7 +52,7 @@ fun ResultsScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
 
-        Text("Results", style = MaterialTheme.typography.titleMedium)
+        Text("RESULTS", style = MonoLabel, color = TextDim)
 
         if (state.error != null) {
             Card(
@@ -74,21 +74,33 @@ fun ResultsScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column {
-                Text(
-                    "${state.found} endpoint(s) found",
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(
+                        state.found.toString(),
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 28.sp,
+                        color = if (state.found > 0) Pass else TextDim,
+                    )
+                    Text(
+                        if (state.found == 1) "endpoint" else "endpoints",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextDim,
+                        modifier = Modifier.padding(start = 7.dp, bottom = 4.dp),
+                    )
+                }
                 state.savedPath?.let { path ->
                     Text(
                         path.substringAfterLast('/'),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MonoData,
+                        color = TextFaint,
                     )
                 }
             }
             state.savedPath?.let { path ->
                 FilledTonalButton(
                     onClick = { shareFile(ctx, path) },
+                    shape = MaterialTheme.shapes.small,
                     modifier = Modifier.height(40.dp),
                 ) {
                     Icon(Icons.Default.Share, contentDescription = "Share",
@@ -99,7 +111,7 @@ fun ResultsScreen(
             }
         }
 
-        HorizontalDivider()
+        HorizontalDivider(color = Rule)
 
         // The file holds the COMPLETE result set; the live list is throttled
         // (≤4/sec) so it can be far short of the real count. Prefer the file
@@ -126,6 +138,7 @@ fun ResultsScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                Spacer(Modifier.weight(1f))
             }
             display.isEmpty() -> {
                 Text(
@@ -133,6 +146,7 @@ fun ResultsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Spacer(Modifier.weight(1f))
             }
             else -> {
                 Text(
@@ -167,12 +181,14 @@ fun ResultsScreen(
         ) {
             OutlinedButton(
                 onClick = onBack,
+                shape = MaterialTheme.shapes.small,
                 modifier = Modifier.weight(1f).height(48.dp),
             ) { Text("Back") }
             Button(
                 onClick = onNewScan,
+                shape = MaterialTheme.shapes.small,
                 modifier = Modifier.weight(1f).height(48.dp),
-            ) { Text("New Scan") }
+            ) { Text("New scan") }
         }
     }
 }
@@ -207,10 +223,10 @@ private fun ResultRow(line: String, onCopy: (String) -> Unit) {
     ) {
         Text(
             display,
+            style = MonoData,
             fontSize = 13.sp,
-            fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.SemiBold,
-            color = MintGreen,
+            color = Pass,
         )
         if (domains.isNotEmpty()) {
             // Show the important domains first (shortened), cap the count, and
@@ -218,13 +234,14 @@ private fun ResultRow(line: String, onCopy: (String) -> Unit) {
             val (tags, extra) = shortDomains(domains, max = 3)
             tags.forEach { name ->
                 Surface(
-                    color = MaterialTheme.colorScheme.secondaryContainer,
-                    shape = MaterialTheme.shapes.small,
+                    color = Inset,
+                    shape = MaterialTheme.shapes.extraSmall,
                 ) {
                     Text(
                         name,
+                        fontFamily = FontFamily.Monospace,
                         fontSize = 10.sp,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        color = TextDim,
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                     )
                 }
@@ -277,11 +294,19 @@ private fun copyToClipboard(ctx: Context, text: String) {
 }
 
 private fun shareFile(ctx: Context, path: String) {
+    // Every failure below used to return silently, so the Share button simply
+    // did nothing and looked broken. Say what went wrong instead.
     val file = File(path)
-    if (!file.exists()) return
+    if (!file.exists()) {
+        Toast.makeText(ctx, "The result file is no longer on disk.", Toast.LENGTH_SHORT).show()
+        return
+    }
     val uri = try {
         FileProvider.getUriForFile(ctx, "${ctx.packageName}.provider", file)
-    } catch (_: Exception) { return }
+    } catch (_: Exception) {
+        Toast.makeText(ctx, "Cannot share from this folder.", Toast.LENGTH_SHORT).show()
+        return
+    }
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
         putExtra(Intent.EXTRA_STREAM, uri)

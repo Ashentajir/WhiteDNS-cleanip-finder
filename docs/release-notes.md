@@ -1,27 +1,36 @@
-WhiteDNS v1.4.4 — a platform scope that means what it says, and the app domains that matter actually working.
+WhiteDNS v1.4.5 — WireGuard and AmneziaWG configs can finally be repointed at a clean IP, and the Android app has been rebuilt as an instrument rather than a menu.
 
-## Scoping a scan to a platform
+## WireGuard and AmneziaWG
 
-**Pick a platform, bring your own targets.** Choosing Vercel now sets a scope rather than replacing what you are scanning. An ASN range, a pasted list or a file are all scanned against that platform, and the platform's own edge addresses become one target source among those rather than the only one. On the desktop the scan-mode screen names the active scope and the hostnames it will probe; on Android the scope survives swapping the targets, and the form says so.
+The config maker understood vless, vmess, trojan, ss and hysteria — all of which are single-line URIs. A WireGuard config is not: it is a multi-line INI document, and the parser had no way to represent one. Pasting a tunnel produced one broken "config" per line.
 
-**A scoped scan probes that platform's hostnames, and only those.** It had been merging the standard IP-scan set in, so an ASN range you picked was still being asked about `workers.dev` and `pages.dev` — and addresses could pass on those, answering a question about Cloudflare rather than the platform you chose.
+**A WireGuard or AmneziaWG config is now read as one config.** The whole `[Interface]` / `[Peer]` block is taken together, repointed at your clean IP by rewriting its `Endpoint` line, and written back with every other byte intact — including AmneziaWG's obfuscation parameters (`Jc`, `Jmin`, `Jmax`, `S1`, `S2`, `H1`–`H4`). Dropping one of those silently breaks the handshake, so they are preserved exactly rather than re-serialised.
 
-*Verified live:* `76.76.21.0/25` scoped to Vercel probes `vercel.app, vercel.com, react.dev, nextjs.org` and accepts 25 addresses. The same range scoped to Cloudflare or Netlify accepts none.
+A block ends where the INI ends, so proxy URIs pasted directly underneath a tunnel are not swallowed into it. A config with no `Endpoint` line gets one added inside its `[Peer]` section; a config with no `[Peer]` section is returned untouched rather than guessed at.
 
-## The app domains now work
+**Amnezia's own `vpn://` share links work too.** The link is unpacked from its compressed envelope and rewritten structurally rather than against a fixed schema, so a config from any Amnezia version keeps every field it arrived with. The container's embedded copy of the tunnel is repointed as well — without that, the client keeps dialling the old address behind an updated host. A link that cannot be decoded passes through untouched instead of being replaced with something corrupt.
 
-`netlify.app`, `pages.dev`, `fly.dev`, `vercel.app`, `workers.dev` — the wildcard suffixes your apps actually live on — could never confirm anything. There is no site at the apex of a wildcard suffix, so an edge serving every app on the platform answers a probe with 404, 530 or nothing at all, and the probe gave up before looking at the certificate already on the table.
+The `wireguard://`, `wg://` and `awg://` URI forms some clients emit are handled, and the reverse direction — pulling `IP:port` endpoints back out — reads all of these too.
 
-A scoped scan now settles the platform question the moment the TLS handshake completes. An edge refuses the handshake outright for a suffix it does not front, so holding a certificate for the name is the evidence, and no page needs to come back.
+**Each tunnel is also written as its own `.conf`.** WireGuard clients import one tunnel per file and cannot read the combined text output, so rewritten tunnels land in a folder beside it, named so the WireGuard Android client will actually accept them as tunnel names.
 
-This applies to scoped scans only. A plain IP scan keeps its own accept rules, so it does not become "any TLS host with a valid certificate passes".
+*Note:* WireGuard is UDP and the IP scanner probes TCP. This works for the case it is meant for — pointing a tunnel at clean edge addresses that serve UDP — but a clean IP found by a TCP scan is not automatically a working WireGuard endpoint.
 
-*Verified live:* an address holding a certificate for `onrender.com` that returns no page is rejected by an unscoped scan and accepted when scoped to Render.
+## The Android app, redesigned
 
-## Target quality
+The interface leaned on colour and gradient where it needed hierarchy. A four-stop gradient banner, nine list cards each with a differently coloured icon chip, and a five-stop progress bar whose hue changed with position rather than with anything measured.
 
-**A stale seed hostname no longer drags a stranger's network into a scan.** One name in Cloudflare's seed list now resolves to a parked host on an unrelated network, and target-building widened it to a /24 that was then scanned as if it were Cloudflare. A platform that publishes its ranges tells us where its edge is, so answers from outside them are dropped; platforms that publish nothing are still mapped entirely from DNS.
+**The app is now styled as the measurement instrument it is.** A stepped graphite ramp carries structure, one signal colour marks what is live or actionable, and three status colours appear only when that status is true. Rows separated by hairlines replace the floating cards, and colour enters on press, so the signal colour still means something. Monospace is reserved for machine data — addresses, ports, counts, results — and prose is set in the UI face.
 
-Every platform's scope hostnames were checked against that platform's own edge for a certificate covering each name.
+The home screen groups its nine tools by the job they do rather than listing them flat. The scan screen leads with the figure you are waiting on. The config maker reports what your paste actually parsed into, per protocol, before you run it — it asks the engine, so the count on screen is the count you will get.
+
+## Fixes
+
+- The Android banner read **v1.4.0** while the build declared 1.4.4. It now comes from the build itself and cannot drift again.
+- The scan log **stopped auto-scrolling** once its 50-line buffer filled — which is exactly when a long scan needs it.
+- Share buttons **did nothing** when a file was missing or unreadable. They now say what went wrong.
+- Config labels were truncated by byte, mangling Persian names; they now cut by character.
+- A multi-line config would have broken the desktop review list's layout.
+- Back and Telegram icons now mirror correctly in right-to-left layouts.
 
 Desktop binaries, Android APKs/AAB, and SHA-256 checksums are attached below.

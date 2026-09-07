@@ -145,6 +145,7 @@ func (m tuiModel) viewConfigMaker(w, h int) string {
 			items = append(items, configMakerDisplayLabel(c, inner-8))
 		}
 		body.WriteString(cmLine(sSuccess, fmt.Sprintf("  Found %d config(s) - all of them will be used", len(configs))))
+		body.WriteString(cmLine(sInfo, "  "+configMakerFormatTally(configs)))
 		body.WriteString(cmLine(sDim, "  Review the list below, then press Enter to continue"))
 		body.WriteString("\n")
 		body.WriteString(configMakerRenderReviewList(items, m.cursor, cmReviewRows(visibleRows, 1)))
@@ -782,10 +783,23 @@ func (m tuiModel) finishConfigMakerTarget(raw string) (tuiModel, tea.Cmd) {
 
 // configMakerDisplayLabel produces a short, human-readable label for a proxy
 // config URI so review lists stay readable even for long base64 vmess blobs.
+// These delegate to the shared internal/configmaker package so the desktop
+// TUI, the mobile bridge and the config parser all name protocols identically.
+func configMakerFormatTally(configs []string) string { return configmaker.FormatTally(configs) }
+func configMakerFormatName(raw string) string       { return configmaker.FormatName(raw) }
+
 func configMakerDisplayLabel(raw string, max int) string {
 	raw = strings.TrimSpace(raw)
 	label := raw
-	if idx := strings.Index(raw, "://"); idx >= 0 {
+	// A WireGuard / AmneziaWG config is a multi-line INI block. Rendering it
+	// raw would push newlines into a single-line list row and shift every line
+	// after it, so name it by protocol and endpoint instead.
+	if configmaker.IsWireguardConfig(raw) {
+		label = configMakerFormatName(raw)
+		if endpoint := configmaker.Endpoint(raw); endpoint != "" {
+			label += " -> " + endpoint
+		}
+	} else if idx := strings.Index(raw, "://"); idx >= 0 {
 		scheme := raw[:idx]
 		rest := raw[idx+3:]
 		if h := strings.LastIndexByte(rest, '#'); h >= 0 && h+1 < len(rest) {
@@ -798,8 +812,15 @@ func configMakerDisplayLabel(raw string, max int) string {
 			label = fmt.Sprintf("%s://%s", scheme, rest)
 		}
 	}
-	if max > 3 && len(label) > max {
-		label = label[:max-3] + "..."
+	// Any other config that spans lines gets cut at the first one, for the same
+	// reason.
+	if i := strings.IndexAny(label, "\r\n"); i >= 0 {
+		label = strings.TrimSpace(label[:i])
+	}
+	// Truncate by runes, not bytes: config fragment names are often Persian and
+	// a byte slice would cut a character in half.
+	if runes := []rune(label); max > 3 && len(runes) > max {
+		label = string(runes[:max-3]) + "..."
 	}
 	return label
 }
@@ -824,11 +845,22 @@ func (m tuiModel) applyConfigMakerRewriteToPath(configText, targetText, outPath 
 		return m, nil
 	}
 
+	// WireGuard / AmneziaWG configs also go out as individual .conf files, since
+	// a client imports one tunnel per file and cannot read the combined list.
+	stem := strings.TrimSuffix(filepath.Base(saved), filepath.Ext(saved))
+	confs, err := configmaker.WriteWireguardConfFiles(filepath.Dir(saved), stem, blocks)
+	if err != nil {
+		m.addLog(fmt.Sprintf("Config maker: could not write WireGuard .conf files: %v", err))
+	}
+
 	m.scanResults = previewStrings(blocks, 25)
 	m.scanErr = nil
 	m.operationType = "config_maker"
 	m.scanKind = "config_maker"
 	m.addLog(fmt.Sprintf("Saved %d rewritten config(s) to %s", len(blocks), saved))
+	if len(confs) > 0 {
+		m.addLog(fmt.Sprintf("Wrote %d importable WireGuard .conf file(s) to %s", len(confs), filepath.Join(filepath.Dir(saved), stem)))
+	}
 	m.setToast(sSuccess.Render("OK Configs rewritten"), 4*time.Second)
 	m.screen = screenScanResults
 	m.cursor = 0

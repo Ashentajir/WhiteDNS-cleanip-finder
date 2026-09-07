@@ -14,10 +14,15 @@ import (
 )
 
 // URIRe matches the proxy-config URI schemes the config maker understands.
-var URIRe = regexp.MustCompile(`(?i)(?:vless|vmess|trojan|ss|hy2|hysteria2)://[^\s]+`)
+// wireguard/wg/awg are the URI form some clients emit for a WireGuard or
+// AmneziaWG peer; vpn:// is Amnezia's own share link. The INI form of those
+// two protocols is not a URI and is handled by ExtractWireguardBlocks.
+var URIRe = regexp.MustCompile(`(?i)(?:vless|vmess|trojan|ss|hy2|hysteria2|wireguard|awg|wg|vpn)://[^\s]+`)
 
-// ExtractConfigs pulls proxy-config URIs out of raw text. If no URI-shaped
-// tokens are found it falls back to treating each non-empty line as a config.
+// ExtractConfigs pulls proxy configs out of raw text: first the multi-line
+// INI-form WireGuard / AmneziaWG blocks, then the URI-shaped tokens in what is
+// left. If neither is found it falls back to treating each non-empty line as a
+// config.
 func ExtractConfigs(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -25,6 +30,17 @@ func ExtractConfigs(raw string) []string {
 	}
 	seen := make(map[string]struct{})
 	var out []string
+
+	// A WireGuard config spans many lines, so its block has to be taken whole
+	// and removed before the per-line URI scan below runs.
+	blocks, raw := ExtractWireguardBlocks(raw)
+	for _, block := range blocks {
+		if _, ok := seen[block]; ok {
+			continue
+		}
+		seen[block] = struct{}{}
+		out = append(out, block)
+	}
 
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
@@ -102,6 +118,21 @@ func ExtractTargets(raw string) []string {
 func ExtractIPs(raw string) []string {
 	seen := make(map[string]struct{})
 	var out []string
+	// INI-form WireGuard / AmneziaWG configs keep their address on an
+	// "Endpoint = ip:port" line inside a multi-line block, not on a line of
+	// their own.
+	blocks, raw := ExtractWireguardBlocks(raw)
+	for _, block := range blocks {
+		endpoint := wireguardEndpoint(block)
+		if endpoint == "" {
+			continue
+		}
+		if _, ok := seen[endpoint]; ok {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		out = append(out, endpoint)
+	}
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -137,7 +168,13 @@ func ExtractIPs(raw string) []string {
 
 // HostPort returns the "host:port" of a proxy-config URI when the host is an IP.
 func HostPort(raw string) string {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
+	raw = strings.TrimSpace(raw)
+	// An Amnezia share link carries no host in the URL: the address lives in
+	// its compressed JSON payload.
+	if strings.HasPrefix(strings.ToLower(raw), "vpn://") {
+		return amneziaEndpoint(raw)
+	}
+	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Host == "" {
 		return ""
 	}
@@ -172,14 +209,28 @@ func RewriteConfigs(configs, targets []string) []string {
 
 func rewriteConfig(configText, target string) string {
 	configText = strings.TrimSpace(configText)
-	if configText == "" || target == "" || !strings.Contains(configText, "://") {
+	if configText == "" || target == "" {
 		return configText
 	}
+	// An INI-form WireGuard / AmneziaWG config is not a URI, so it must be
+	// routed before the "://" gate below. The trailing newline keeps a blank
+	// line between consecutive blocks once the results are joined, so the
+	// output stays readable and re-parses into the same configs.
+	if IsWireguardConfig(configText) {
+		return rewriteWireguardINI(configText, target) + "\n"
+	}
+	if !strings.Contains(configText, "://") {
+		return configText
+	}
+	switch {
 	// vmess:// is base64-encoded JSON, not a URL — rewrite its add/port fields so
 	// the config stays valid (a naive host swap corrupts it and the client
 	// silently drops it).
-	if strings.HasPrefix(strings.ToLower(configText), "vmess://") {
+	case strings.HasPrefix(strings.ToLower(configText), "vmess://"):
 		return rewriteVmess(configText, target)
+	// vpn:// is Amnezia's compressed-JSON share link, likewise not a URL.
+	case strings.HasPrefix(strings.ToLower(configText), "vpn://"):
+		return rewriteAmnezia(configText, target)
 	}
 	return rewriteURLStyle(configText, target)
 }

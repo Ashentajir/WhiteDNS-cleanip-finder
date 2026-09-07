@@ -18,7 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -237,16 +237,30 @@ class MainActivity : ComponentActivity() {
 
                 Scaffold(
                     topBar = {
+                      Column {
                         TopAppBar(
-                            title = { Text(screenTitle) },
+                            title = {
+                                Text(
+                                    screenTitle.uppercase(),
+                                    style = MonoLabel,
+                                    color = TextDim,
+                                )
+                            },
+                            colors = TopAppBarDefaults.topAppBarColors(
+                                containerColor = Ink,
+                                titleContentColor = TextDim,
+                                navigationIconContentColor = TextDim,
+                            ),
                             navigationIcon = {
                                 if (screen != Screen.Home) {
                                     IconButton(onClick = goBack) {
-                                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                                     }
                                 }
                             },
                         )
+                        HorizontalDivider(color = Rule)
+                      }
                     },
                 ) { padding ->
                     Box(
